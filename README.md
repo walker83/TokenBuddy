@@ -122,6 +122,24 @@ Everything on the right of the arrow is one process: collectors run on sync,
 Parquet is both the storage and the exchange format, DuckDB is embedded, and
 the UI is a single HTML file compiled into the binary.
 
+## Agent self-evolution
+
+The corpus TokenBuddy builds is machine-readable, so your coding agent can
+consume it: point it at the local API (or read the Parquet directly) and ask
+for a daily retrospective — what got built, which flows keep repeating, what
+should become a skill or a repo rule.
+
+What makes this affordable is tiered summarization: ~80% of sessions are
+two-message throwaways that get a free rule-based digest (the first user
+message *is* the intent), and only substantive sessions go to an LLM. On a
+real 3,391-session corpus this turned 4.2 MB of raw conversation into ~0.4 MB
+of digests — **90% fewer tokens** than feeding raw logs back to a model, with
+every session still individually summarized (no sampling).
+
+A practical loop: a daily digest for "what did I do today", a weekly pass
+over substantive sessions, a monthly full report — and any flow that shows
+up three or more times is a skill candidate.
+
 ## Data & privacy
 
 | File | Contents |
