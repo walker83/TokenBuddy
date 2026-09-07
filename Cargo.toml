@@ -1,0 +1,35 @@
+[package]
+name = "local-token-compute"
+description = "TokenBuddy — local-first token usage, session analytics and full-text context search for AI coding agents"
+license = "MIT"
+repository = "https://github.com/walker83/TokenBuddy"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.75"
+
+[[bin]]
+name = "ltc"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+rusqlite = { version = "0.31" }
+duckdb = { version = "1.1", features = ["bundled"] }
+arrow = "58"
+parquet = { version = "58", features = ["zstd"] }
+anyhow = "1"
+tiny_http = "0.12"
+jieba-rs = { version = "0.7", features = ["default-dict"] }
+
+[lib]
+name = "local_token_compute"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
