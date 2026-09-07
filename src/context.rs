@@ -6,7 +6,7 @@
 //! raw logs stay out, which is what keeps search results from drowning in
 //! cached repeats.
 //!
-//! Pipeline: collectors → normalize+hash dedupe → `~/.ltc/context.parquet` →
+//! Pipeline: collectors → normalize+hash dedupe → `~/.tokenbuddy/context.parquet` →
 //! in-memory gram index (ASCII tokens in a BTreeMap so queries can match by
 //! prefix, CJK character bigrams in a HashMap). Queries first decide which
 //! terms carry information: a term covering more than 30% of the corpus is a
@@ -16,7 +16,7 @@
 //! rank by idf-weighted coverage, hit density, exact-phrase bonus, role and
 //! recency. Every search fills a `SearchTrace` (tier, pool sizes, per-stage
 //! timings) that the server logs to stderr, returns in the response, and
-//! appends as one JSON line to `~/.ltc/search-log.jsonl` (rotated past 5MB),
+//! appends as one JSON line to `~/.tokenbuddy/search-log.jsonl` (rotated past 5MB),
 //! so query efficiency stays observable, tunable, and regressable against
 //! real traffic. The index is rebuilt in a background thread after each
 //! sync; the parquet file is the durable state, so a restart just re-reads
@@ -311,7 +311,7 @@ fn zcode_opencode_mimo_messages() -> Vec<ContextMessage> {
             Ok(())
         })();
         if let Err(e) = ok {
-            eprintln!("[LTC] context: {} extraction failed: {e}", source.as_str());
+            eprintln!("[TokenBuddy] context: {} extraction failed: {e}", source.as_str());
         }
     }
     msgs
@@ -440,7 +440,7 @@ pub fn sync_context(path: &Path, clear: bool) -> Result<SyncStats> {
 pub fn sync_messages(path: &Path, clear: bool, messages: Vec<ContextMessage>) -> Result<SyncStats> {
     if path.exists() && (clear || !parquet_is_current_schema(path)) {
         if !clear {
-            eprintln!("[LTC] context: legacy parquet schema, rebuilding");
+            eprintln!("[TokenBuddy] context: legacy parquet schema, rebuilding");
         }
         let _ = std::fs::remove_file(path);
     }
@@ -926,7 +926,7 @@ impl ContextIndex {
                 }
                 other => {
                     if let Some(Err(e)) = other {
-                        eprintln!("[LTC] context: tools parquet unreadable, index stays conversation-only: {e}");
+                        eprintln!("[TokenBuddy] context: tools parquet unreadable, index stays conversation-only: {e}");
                     }
                 }
             }
@@ -2180,7 +2180,7 @@ impl ContextHandle {
                 stats.tool_content_dup_skipped = t.content_dup_skipped;
                 stats.tool_total = t.total;
             }
-            Err(e) => eprintln!("[LTC] context: tools sync failed (non-fatal): {e}"),
+            Err(e) => eprintln!("[TokenBuddy] context: tools sync failed (non-fatal): {e}"),
         }
         self.set_phase(Phase::Building, None);
         match ContextIndex::build(&self.parquet_path) {
@@ -2241,7 +2241,7 @@ impl ContextHandle {
         let q: String = query.split_whitespace().collect::<Vec<_>>().join(" ");
         let q: String = q.chars().take(60).collect();
         eprintln!(
-            "[LTC] ctx-search q={q:?} tier={} terms={}/{} pool={}/{} verified={} matched={} dedup={} ret={} {}ms [terms {}µs pool {}µs verify {}µs]",
+            "[TokenBuddy] ctx-search q={q:?} tier={} terms={}/{} pool={}/{} verified={} matched={} dedup={} ret={} {}ms [terms {}µs pool {}µs verify {}µs]",
             t.tier,
             t.terms_content,
             t.terms_total,
@@ -2280,7 +2280,7 @@ impl ContextHandle {
             return;
         };
         if let Err(e) = append_search_line(&self.search_log_path, &line, SEARCH_LOG_MAX_BYTES) {
-            eprintln!("[LTC] ctx-search log write failed: {e}");
+            eprintln!("[TokenBuddy] ctx-search log write failed: {e}");
         }
     }
 }
@@ -2351,7 +2351,7 @@ mod tests {
 
     #[test]
     fn index_build_and_search_roundtrip() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("context.parquet");
@@ -2450,7 +2450,7 @@ mod tests {
 
     #[test]
     fn bigram_tier_catches_fragments_that_words_miss() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_frag_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_frag_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("context.parquet");
@@ -2484,7 +2484,7 @@ mod tests {
 
     #[test]
     fn stopwords_stay_out_of_pools_and_highlights() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_stop_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_stop_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("context.parquet");
@@ -2539,7 +2539,7 @@ mod tests {
 
     #[test]
     fn verbose_query_pools_on_rarest_terms_only() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_verbose_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_verbose_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("context.parquet");
@@ -2610,7 +2610,7 @@ mod tests {
 
     #[test]
     fn prefix_query_matches_partial_tokens() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_prefix_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_prefix_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("context.parquet");
@@ -2656,7 +2656,7 @@ mod search_regression {
     /// unique — nothing dedupes, every row is a doc. Returns the index and
     /// its temp dir (caller removes it).
     fn reg_index(name: &str, docs: &[(i64, &str)]) -> (ContextIndex, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_reg_{name}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_reg_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("context.parquet");
@@ -2689,7 +2689,7 @@ mod search_regression {
 
     /// Like `reg_index`, with an explicit project per doc.
     fn reg_index_proj(name: &str, docs: &[(i64, &str, &str)]) -> (ContextIndex, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_regp_{name}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_regp_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("context.parquet");
@@ -2778,7 +2778,7 @@ mod search_regression {
     fn session_view_windows_around_anchor() {
         let home = dirs::home_dir().unwrap().to_string_lossy().to_string();
         let alpha = format!("{}/code/alpha", home);
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_sess_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_sess_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("context.parquet");
@@ -2847,7 +2847,7 @@ mod search_regression {
     #[test]
     fn session_titles_prefer_explicit_then_first_user_message() {
         // Two sessions built explicitly so title provenance is unambiguous.
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_title_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_title_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("context.parquet");
@@ -2924,7 +2924,7 @@ mod search_regression {
 
     #[test]
     fn legacy_parquet_without_project_rebuilds() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_legacy_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_legacy_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("context.parquet");
@@ -3115,7 +3115,7 @@ mod search_regression {
         // never said the query words). The top-up pass must still surface
         // each session's human line — the user doc just before the ranked
         // reply — right after that reply, so person and agent read as a pair.
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_topup_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_topup_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("context.parquet");
@@ -3219,7 +3219,7 @@ mod search_regression {
         // the query words; the reply must fold into the human's hit.
         // A second session with the same question stays — a repeat across
         // sessions is real signal, and one session of it remains as anchor.
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_echo_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_echo_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("context.parquet");
@@ -3325,7 +3325,7 @@ mod search_regression {
 
     #[test]
     fn search_log_appends_and_rotates() {
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_logrot_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_logrot_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("search-log.jsonl");
@@ -3344,7 +3344,7 @@ mod search_regression {
 
     #[test]
     fn handle_writes_search_log_jsonl() {
-        let dir = std::env::temp_dir().join(format!("ltc_ctx_loghandle_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_loghandle_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let handle = ContextHandle::new(dir.join("context.parquet"));

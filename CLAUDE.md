@@ -1,4 +1,4 @@
-# LTC 开发约定
+# TokenBuddy 开发约定
 
 ## 构建规则（必须遵守）
 
@@ -15,14 +15,14 @@ cargo test --release
 - 短别名 `b` / `r` / `c` 已在 `.cargo/config.toml` 定义，等价于 `--release`。
 - 不要执行 `cargo build` / `cargo test` / `cargo run`（无 `--release` 的形式），
   也不要使用 `--profile dev`。
-- 服务以 `./target/release/ltc` 常驻 127.0.0.1:8080，重启前先
-  `pkill -f target/release/ltc`。
+- 服务以 `./target/release/tokenbuddy` 常驻 127.0.0.1:8080，重启前先
+  `pkill -f target/release/tokenbuddy`。
 - 保持 `target/` 只保留 release 产物；如需深度清理，保留
-  `target/release/ltc` 二进制即可。
+  `target/release/tokenbuddy` 二进制即可。
 
 ## 存储引擎
 
-只支持 DuckDB：所有来源写入同一份 `~/.ltc/data.parquet`，DuckDB 用
+只支持 DuckDB：所有来源写入同一份 `~/.tokenbuddy/data.parquet`，DuckDB 用
 `read_parquet` 查询。`LTC_STORE` 开关、DataFusion 与 RorisDB/MySQL 后端均已
 删除，不要再加回多引擎分发。
 
@@ -37,7 +37,7 @@ models 走 `store.rs` 里的纯 Rust 聚合（`rust_read_agg_columns` +
 对话全文搜索在 `context.rs`：各采集器的 `collect_messages()` 只提取
 user/assistant 对话文本（工具输出、tool_result、system 重发上下文一律不进
 索引——重复缓存淹没搜索结果正是要解决的问题），归一化哈希去重后写
-`~/.ltc/context.parquet`，查询走纯 Rust 内存倒排索引。分词三层：ASCII
+`~/.tokenbuddy/context.parquet`，查询走纯 Rust 内存倒排索引。分词三层：ASCII
 token（BTreeMap，≥3 字符支持前缀模糊）、jieba 词元（`jieba_rs`，精度层）、
 CJK 字符 bigram（召回层，兜住跨词边界的片段查询如"下文搜"）；候选级联是
 词元 AND → bigram AND → 共享词元排序，改任何一层都要带上跨边界用例。搜索框
@@ -49,7 +49,7 @@ FTS5（实测 `no such module: fts5`），不要再尝试 SQLite FTS 或往回�
 ## 计量口径
 
 - **不做成本**：本项目**不计算、不展示任何货币成本**。`pricing.rs` / `budget.rs`
-  / `/api/budget` / `~/.ltc/pricing.json` / `~/.ltc/budget.json` 已整体删除，
+  / `/api/budget` / `~/.tokenbuddy/pricing.json` / `~/.tokenbuddy/budget.json` 已整体删除，
   各聚合结构体里的 `cost*` / `currency` / `free` / `estimated_price` 字段也一并
   移除，不要再加回来——混元等模型没有可核对的单价，估出来的数没有意义。
   排行、份额、热力图、堆叠图一律以 **total_tokens** 排序和度量。

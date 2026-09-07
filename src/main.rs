@@ -1,8 +1,7 @@
 use anyhow::Result;
-use local_token_compute::context::{self, ContextHandle};
-use local_token_compute::store::{Store, TimelineMode};
+use tokenbuddy::context::{self, ContextHandle};
+use tokenbuddy::store::{Store, TimelineMode};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tiny_http::{Header, Response, Server};
 
@@ -102,21 +101,18 @@ fn main() -> Result<()> {
     // the background so the dashboard is up immediately; until it lands the
     // search endpoint reports the in-progress phase.
     let context = Arc::new(ContextHandle::new(
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".ltc")
-            .join("context.parquet"),
+        tokenbuddy::data_dir().join("context.parquet"),
     ));
     {
         let ctx = Arc::clone(&context);
         std::thread::spawn(move || {
             if let Err(e) = ctx.sync_and_build(false) {
-                eprintln!("[LTC] context index build failed: {e}");
+                eprintln!("[TokenBuddy] context index build failed: {e}");
             }
         });
     }
 
-    println!("LTC server running on http://127.0.0.1:8080");
+    println!("TokenBuddy server running on http://127.0.0.1:8080");
     println!("Press Ctrl+C to stop");
 
     for request in server.incoming_requests() {
@@ -159,7 +155,7 @@ fn main() -> Result<()> {
                         let ctx = Arc::clone(&context);
                         std::thread::spawn(move || {
                             if let Err(e) = ctx.sync_and_build(false) {
-                                eprintln!("[LTC] context refresh failed: {e}");
+                                eprintln!("[TokenBuddy] context refresh failed: {e}");
                             }
                         });
                         json_response(json)
@@ -234,7 +230,7 @@ fn main() -> Result<()> {
                 let ctx = Arc::clone(&context);
                 std::thread::spawn(move || {
                     if let Err(e) = ctx.sync_and_build(true) {
-                        eprintln!("[LTC] context rebuild failed: {e}");
+                        eprintln!("[TokenBuddy] context rebuild failed: {e}");
                     }
                 });
                 json_response(serde_json::json!({ "started": true }).to_string())
@@ -258,7 +254,7 @@ fn time_range_start(time_range: Option<&str>) -> Option<i64> {
         Some("90d") => 90,
         _ => return None,
     };
-    Some(local_token_compute::cn_midnight(days_ago))
+    Some(tokenbuddy::cn_midnight(days_ago))
 }
 
 /// The `timeRange` / `source` / `model` triple every report endpoint accepts.
@@ -336,7 +332,7 @@ fn handle_context_search(context: &ContextHandle, path: &str) -> Result<String> 
         source: source.as_deref(),
         role: role.as_deref(),
         project: project.as_deref(),
-        since: days.map(local_token_compute::cn_midnight),
+        since: days.map(tokenbuddy::cn_midnight),
         limit,
         exclude_sessions: &exclude_sessions,
     };
@@ -434,8 +430,8 @@ fn handle_timeline(store: &Store, path: &str) -> Result<String> {
 /// China-local midnight so the daily buckets still align to whole days, and
 /// the current window still runs right up to now.
 fn digest_windows(days: i64) -> (i64, i64, i64) {
-    let now = local_token_compute::now_ts();
-    let cur_start = local_token_compute::cn_midnight(0) - days * 86_400;
+    let now = tokenbuddy::now_ts();
+    let cur_start = tokenbuddy::cn_midnight(0) - days * 86_400;
     let span = (now - cur_start).max(1);
     (cur_start, now, cur_start - span)
 }
@@ -458,7 +454,7 @@ fn handle_digest(store: &Store, path: &str) -> Result<String> {
     let prev = store.query_summary(None, None, Some(prev_start), Some(cur_start))?;
     let daily = store.query_timeline(TimelineMode::Daily, None, None, Some(cur_start), Some(now))?;
 
-    let cache_hit = |s: &local_token_compute::store::Summary| {
+    let cache_hit = |s: &tokenbuddy::store::Summary| {
         let input_side = s.total_input_tokens + s.total_cache_read_tokens;
         if input_side > 0 {
             Some(s.total_cache_read_tokens as f64 / input_side as f64)
@@ -466,7 +462,7 @@ fn handle_digest(store: &Store, path: &str) -> Result<String> {
             None
         }
     };
-    let window = |s: &local_token_compute::store::Summary| {
+    let window = |s: &tokenbuddy::store::Summary| {
         serde_json::json!({
             "tokens": s.total_tokens,
             "requests": s.total_requests,
@@ -484,7 +480,7 @@ fn handle_digest(store: &Store, path: &str) -> Result<String> {
         }
     };
 
-    let mut top_models: Vec<&local_token_compute::store::ModelRow> =
+    let mut top_models: Vec<&tokenbuddy::store::ModelRow> =
         cur.by_model.iter().collect();
     top_models.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
     let top_models: Vec<serde_json::Value> = top_models

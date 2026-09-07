@@ -499,18 +499,18 @@ impl Store {
             }
         }
 
-        let db_path = base.join("ltc.duckdb");
+        let db_path = base.join("tokenbuddy.duckdb");
         let parquet_path = base.join("data.parquet");
 
         // Migrate old DataFusion parquet if needed
         let old_df_path = base.join("df").join("token_records.parquet");
         if old_df_path.exists() && !parquet_path.exists() {
-            eprintln!("[LTC] Migrating old DataFusion parquet to unified path");
+            eprintln!("[TokenBuddy] Migrating old DataFusion parquet to unified path");
             let _ = std::fs::rename(&old_df_path, &parquet_path);
         }
 
         let conn = duckdb::Connection::open(&db_path)?;
-        eprintln!("[LTC] Using DuckDB store");
+        eprintln!("[TokenBuddy] Using DuckDB store");
         migrate_parquet_schema(&parquet_path)?;
 
         Ok(Self {
@@ -550,22 +550,22 @@ impl Store {
     /// leave the store looking empty — and `record_count()` would report 0 —
     /// while the data is in fact sitting intact in the snapshot file.
     pub fn sync_full(&self) -> Result<SyncResult> {
-        eprintln!("[LTC] sync_full: rebuilding from scratch...");
+        eprintln!("[TokenBuddy] sync_full: rebuilding from scratch...");
         let snapshot = self.snapshot_parquet()?;
         match sync_to_parquet(&self.parquet_path, true) {
             Ok(result) => {
                 let kept = self.prune_snapshots(SNAPSHOT_KEEP)?;
                 if kept > 0 {
-                    eprintln!("[LTC] sync_full: pruned {kept} old snapshot(s)");
+                    eprintln!("[TokenBuddy] sync_full: pruned {kept} old snapshot(s)");
                 }
                 Ok(result)
             }
             Err(e) => {
                 if let Some(snap) = snapshot {
-                    eprintln!("[LTC] sync_full failed ({e}); restoring {}", snap.display());
+                    eprintln!("[TokenBuddy] sync_full failed ({e}); restoring {}", snap.display());
                     if let Err(restore) = std::fs::rename(&snap, &self.parquet_path) {
                         eprintln!(
-                            "[LTC] sync_full: restore failed, data is still at {}: {restore}",
+                            "[TokenBuddy] sync_full: restore failed, data is still at {}: {restore}",
                             snap.display()
                         );
                     }
@@ -585,7 +585,7 @@ impl Store {
         let name = format!("data.{}.snap.parquet", stamp);
         let dest = self.parquet_path.with_file_name(name);
         std::fs::rename(&self.parquet_path, &dest)?;
-        eprintln!("[LTC] sync_full: snapshot kept at {}", dest.display());
+        eprintln!("[TokenBuddy] sync_full: snapshot kept at {}", dest.display());
         Ok(Some(dest))
     }
 
@@ -943,7 +943,7 @@ fn migrate_parquet_schema(path: &Path) -> Result<()> {
     if !outdated {
         return Ok(());
     }
-    eprintln!("[LTC] Migrating data.parquet to the current schema");
+    eprintln!("[TokenBuddy] Migrating data.parquet to the current schema");
     let aligned: Vec<RecordBatch> = batches
         .iter()
         .map(|b| align_batch(b, &want))
@@ -1023,9 +1023,7 @@ fn duck_timeline_query(
 }
 
 fn get_store_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ltc")
+    crate::data_dir()
 }
 
 // ============================================================

@@ -12,7 +12,7 @@
 //! collapse into `content_dup_skipped` — that rate is the real noise number
 //! R1's acceptance gate reads.
 //!
-//! Storage is a second parquet cache (`~/.ltc/tools.parquet`) beside the
+//! Storage is a second parquet cache (`~/.tokenbuddy/tools.parquet`) beside the
 //! conversation one: same engine, same write pattern (tmp + rename), no new
 //! query engine. Raw output is the T0 layer — nothing here feeds the in-memory
 //! index yet; that is R2 (bounded synopsis).
@@ -434,7 +434,7 @@ fn lineage_tool_events() -> Vec<ToolEvent> {
             Ok(())
         })();
         if let Err(e) = ok {
-            eprintln!("[LTC] tools: {} extraction failed: {e}", source.as_str());
+            eprintln!("[TokenBuddy] tools: {} extraction failed: {e}", source.as_str());
         }
     }
     evs
@@ -457,7 +457,7 @@ mod tests {
     }
 
     fn tmp_path(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ltc-tools-test-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy-tools-test-{tag}-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir.join("tools.parquet")
     }

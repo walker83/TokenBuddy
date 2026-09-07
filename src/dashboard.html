@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LTC · Token 管理台</title>
+<title>TokenBuddy · Token 管理台</title>
 <style>
 :root {
   --bg: #ffffff; --panel: #ffffff; --panel2: #f5f5f7; --border: #e8e8ed;
@@ -342,7 +342,7 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
 <nav class="topnav">
   <div class="topnav-inner">
     <div class="brand">
-      <span class="logo">◆</span><h1>LTC</h1><span class="sub">Local Token Compute · Token 管理台</span>
+      <span class="logo">◆</span><h1>TokenBuddy</h1><span class="sub">Local-first · Token 管理台</span>
     </div>
     <nav class="nav-menu">
       <a class="nav-item active" data-view="stats">统计</a>
@@ -602,7 +602,7 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
 </div>
 </div>
 
-<footer>LTC v0.3 · 数据来自 Claude / OpenCode / Mimo / Zcode / Pi / Qoder / WorkBuddy 本地日志</footer>
+<footer>TokenBuddy v0.3 · 数据来自 Claude / OpenCode / Mimo / Zcode / Pi / Qoder / WorkBuddy 本地日志</footer>
 
 <script>
 const SRC_COLORS = { claude: '#0071e3', opencode: '#34a853', mimo: '#9a4ddb', zcode: '#e8820c', pi: '#0ea5a0', qoder: '#e0447c', workbuddy: '#5e6ad2' };
@@ -1070,7 +1070,7 @@ function quickPickOnPage(link) {
 }
 
 // ---------- 最近搜索（本地保留最近 10 次，跨刷新） ----------
-const RECENT_KEY = 'ltcRecentSearches';
+const RECENT_KEY = 'tokenbuddyRecentSearches';
 function loadRecent() {
   try { const v = JSON.parse(localStorage.getItem(RECENT_KEY)); return Array.isArray(v) ? v.filter(x => typeof x === 'string') : []; }
   catch (_) { return []; }
@@ -1108,7 +1108,7 @@ function renderRecentInto(elId, onPick) {
 }
 
 // ---------- 搜索偏好（数量 / 排序 / 摘要模式，本地持久化） ----------
-const PREFS_KEY = 'ltcSearchPrefs';
+const PREFS_KEY = 'tokenbuddySearchPrefs';
 function loadPrefs() {
   try { const v = JSON.parse(localStorage.getItem(PREFS_KEY)); return (v && typeof v === 'object') ? v : {}; }
   catch (_) { return {}; }
@@ -1136,7 +1136,7 @@ function sortResults(results, mode) {
 }
 
 // ---------- 搜索记录（结果快照持久化，可回看 / 再导出） ----------
-const HISTORY_KEY = 'ltcSearchHistory';
+const HISTORY_KEY = 'tokenbuddySearchHistory';
 function loadHistory() {
   try { const v = JSON.parse(localStorage.getItem(HISTORY_KEY)); return Array.isArray(v) ? v : []; }
   catch (_) { return []; }
@@ -1439,7 +1439,7 @@ function exportResultsMd(d) {
   const stamp = now.toISOString().slice(0, 16).replace(/[T:]/g, '-');
   const safeQ = String(d.query || 'search').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40);
   const md = [
-    `# LTC 上下文搜索结果`, ``,
+    `# TokenBuddy 上下文搜索结果`, ``,
     `- **查询**：${d.query}`,
     `- **时间**：${now.toLocaleString('zh-CN')}`,
     `- **命中**：${d.results.length} 条 · 耗时 ${d.elapsed_ms ?? '?'}ms`,
@@ -1459,7 +1459,7 @@ function exportResultsMd(d) {
   const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `LTC搜索_${safeQ}_${stamp}.md`;
+  a.download = `TokenBuddy搜索_${safeQ}_${stamp}.md`;
   document.body.appendChild(a);
   a.click();
   a.remove();

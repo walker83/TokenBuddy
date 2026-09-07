@@ -53,7 +53,7 @@ ASCII 词元支持前缀模糊、jieba 负责中文词粒度、CJK 字符 bigram
 反馈与搜索质量面板。十万轮量级的索引几秒建完，持久化到 Parquet。
 
 **一份 Parquet，装下所有工具**
-所有来源写入同一个 `~/.ltc/data.parquet`（Arrow schema，zstd 压缩）。
+所有来源写入同一个 `~/.tokenbuddy/data.parquet`（Arrow schema，zstd 压缩）。
 summary / timeline 走 DuckDB SQL 查 `read_parquet`；metrics / 热力图 / 模型表
 走纯 Rust 聚合路径，只投影需要的列（读取量省约 62%）。同步是增量的——
 见过的记录自动跳过；全量重建保留轮转快照。
@@ -85,7 +85,7 @@ summary / timeline 走 DuckDB SQL 查 `read_parquet`；metrics / 热力图 / 模
 git clone https://github.com/walker83/TokenBuddy.git
 cd TokenBuddy
 cargo b                     # 即 build --release（别名见 .cargo/config.toml）
-./target/release/ltc
+./target/release/tokenbuddy
 # 打开 http://127.0.0.1:8080
 ```
 
@@ -94,15 +94,14 @@ cargo b                     # 即 build --release（别名见 .cargo/config.toml
 - 点仪表盘的 **同步数据**（或 `POST /api/sync`）拉取最新日志；上下文索引
   随之自动刷新。
 - 仪表盘任意位置按 <kbd>/</kbd> 聚焦搜索框。
-- 二进制与数据路径沿用项目原名：CLI 叫 `ltc`，数据在 `~/.ltc/` 下。
 
 ## 工作原理
 
 ```
-Claude Code ─┐                            ┌─► ~/.ltc/data.parquet     ─► DuckDB SQL ─┐
+Claude Code ─┐                            ┌─► ~/.tokenbuddy/data.parquet     ─► DuckDB SQL ─┐
 ZCode        │  本地会话日志               │                                          ├─► 仪表盘
 Qoder        ├─►  （各工具自己的      ─►  │                                          │   127.0.0.1:8080
-WorkBuddy    │     格式与目录）           └─► ~/.ltc/context.parquet ─► 内存倒排索引  ┘
+WorkBuddy    │     格式与目录）           └─► ~/.tokenbuddy/context.parquet ─► 内存倒排索引  ┘
 OpenCode     │                                （去重后的对话轮）
 Mimo / Pi  ──┘
 ```
@@ -114,12 +113,12 @@ Mimo / Pi  ──┘
 
 | 文件 | 内容 |
 |---|---|
-| `~/.ltc/data.parquet` | 每行一条带 Token 的请求：来源、工程、模型、Token 数、耗时、点数…… |
-| `~/.ltc/context.parquet` | 去重后的 user/assistant 对话轮（供搜索） |
-| `~/.ltc/data.parquet.snapshots/` | 全量重建保留的轮转快照（保留 5 份） |
+| `~/.tokenbuddy/data.parquet` | 每行一条带 Token 的请求：来源、工程、模型、Token 数、耗时、点数…… |
+| `~/.tokenbuddy/context.parquet` | 去重后的 user/assistant 对话轮（供搜索） |
+| `~/.tokenbuddy/data.parquet.snapshots/` | 全量重建保留的轮转快照（保留 5 份） |
 
 HTTP API 天然只监听本地；没有可泄密的配置、没有账号、没有导出目标。删掉
-`~/.ltc/`，TokenBuddy 就对你一无所知。
+`~/.tokenbuddy/`，TokenBuddy 就对你一无所知。
 
 ## HTTP API
 

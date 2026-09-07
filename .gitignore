@@ -15,7 +15,7 @@ Thumbs.db
 
 # Logs
 *.log
-ltc.log
+tokenbuddy.log
 
 # Build artifacts
 *.pdb

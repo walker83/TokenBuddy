@@ -11,6 +11,28 @@ pub mod tools;
 
 use chrono::Datelike;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Root data directory: `~/.tokenbuddy`. The historical name was `~/.ltc`;
+/// the one-time rename below carries existing data across the rebrand so an
+/// upgrade never starts from an empty store.
+pub fn data_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let dir = home.join(".tokenbuddy");
+    if !dir.exists() {
+        let old = home.join(".ltc");
+        if old.is_dir() {
+            if let Err(e) = std::fs::rename(&old, &dir) {
+                eprintln!(
+                    "[TokenBuddy] cannot migrate {} -> {}: {e}",
+                    old.display(),
+                    dir.display()
+                );
+            }
+        }
+    }
+    dir
+}
 
 /// All day/week/month bucketing and every `timeRange` filter uses China
 /// Standard Time. Source logs store true UTC epoch seconds, so the offset is
@@ -223,7 +245,7 @@ mod tests {
     /// missing file.
     #[test]
     fn file_mtime_is_epoch_seconds_and_none_when_absent() {
-        let dir = std::env::temp_dir().join(format!("ltc-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tokenbuddy-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir should be creatable");
         let path = dir.join("sample.jsonl");
         std::fs::write(&path, "{}").expect("temp file should be writable");

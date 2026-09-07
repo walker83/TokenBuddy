@@ -1,5 +1,5 @@
 [package]
-name = "local-token-compute"
+name = "tokenbuddy"
 description = "TokenBuddy — local-first token usage, session analytics and full-text context search for AI coding agents"
 license = "MIT"
 repository = "https://github.com/walker83/TokenBuddy"
@@ -8,7 +8,7 @@ edition = "2021"
 rust-version = "1.75"
 
 [[bin]]
-name = "ltc"
+name = "tokenbuddy"
 path = "src/main.rs"
 
 [dependencies]
@@ -25,7 +25,7 @@ tiny_http = "0.12"
 jieba-rs = { version = "0.7", features = ["default-dict"] }
 
 [lib]
-name = "local_token_compute"
+name = "tokenbuddy"
 path = "src/lib.rs"
 
 [profile.release]

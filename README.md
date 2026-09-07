@@ -62,7 +62,7 @@ feedback and a search-quality panel. An index of ~10⁵ turns builds in seconds
 and persists to Parquet.
 
 **One local Parquet, every agent**
-All sources append into a single `~/.ltc/data.parquet` (Arrow schema, zstd).
+All sources append into a single `~/.tokenbuddy/data.parquet` (Arrow schema, zstd).
 Summary/timeline queries go through DuckDB SQL over `read_parquet`; metrics,
 heatmaps and model tables use a pure-Rust aggregation path that projects only
 the columns it needs (~62% less read volume). Sync is incremental —
@@ -97,7 +97,7 @@ Requires Rust 1.75+.
 git clone https://github.com/walker83/TokenBuddy.git
 cd TokenBuddy
 cargo b                     # build --release (alias defined in .cargo/config.toml)
-./target/release/ltc
+./target/release/tokenbuddy
 # open http://127.0.0.1:8080
 ```
 
@@ -106,16 +106,14 @@ cargo b                     # build --release (alias defined in .cargo/config.to
 - Hit the **Sync** button (or `POST /api/sync`) to pull the latest logs; the
   context index refreshes alongside automatically.
 - In the dashboard, <kbd>/</kbd> focuses the search box from anywhere.
-- Binary and data paths keep the project's original callsign: the CLI is
-  `ltc` and data lives under `~/.ltc/`.
 
 ## How it works
 
 ```
-Claude Code ─┐                            ┌─► ~/.ltc/data.parquet     ─► DuckDB SQL ─┐
+Claude Code ─┐                            ┌─► ~/.tokenbuddy/data.parquet     ─► DuckDB SQL ─┐
 ZCode        │  local session logs        │                                          ├─► dashboard
 Qoder        ├─►  (each tool's own   ─►   │                                          │   127.0.0.1:8080
-WorkBuddy    │     format on disk)        └─► ~/.ltc/context.parquet ─► in-memory    │
+WorkBuddy    │     format on disk)        └─► ~/.tokenbuddy/context.parquet ─► in-memory    │
 OpenCode     │                                (deduplicated turns)      inverted idx ┘
 Mimo / Pi  ──┘
 ```
@@ -128,12 +126,12 @@ the UI is a single HTML file compiled into the binary.
 
 | File | Contents |
 |---|---|
-| `~/.ltc/data.parquet` | one row per token-bearing request: source, project, model, tokens, duration, credits… |
-| `~/.ltc/context.parquet` | deduplicated user/assistant turns for search |
-| `~/.ltc/data.parquet.snapshots/` | rotated snapshots kept by full rebuilds (5 retained) |
+| `~/.tokenbuddy/data.parquet` | one row per token-bearing request: source, project, model, tokens, duration, credits… |
+| `~/.tokenbuddy/context.parquet` | deduplicated user/assistant turns for search |
+| `~/.tokenbuddy/data.parquet.snapshots/` | rotated snapshots kept by full rebuilds (5 retained) |
 
 The HTTP API is local-only by construction. There is no config to leak, no
-account, no export target. Delete `~/.ltc/` and TokenBuddy knows nothing about
+account, no export target. Delete `~/.tokenbuddy/` and TokenBuddy knows nothing about
 you again.
 
 ## HTTP API

@@ -1429,23 +1429,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
-name = "local-token-compute"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "arrow",
- "chrono",
- "dirs",
- "duckdb",
- "jieba-rs",
- "parquet",
- "rusqlite",
- "serde",
- "serde_json",
- "tiny_http",
-]
-
-[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2512,6 +2495,23 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "tokenbuddy"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "dirs",
+ "duckdb",
+ "jieba-rs",
+ "parquet",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tiny_http",
+]
 
 [[package]]
 name = "tokio"
