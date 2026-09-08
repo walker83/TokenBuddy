@@ -2,85 +2,115 @@
 
 # TokenBuddy
 
-**WakaTime for AI coding agents — local-first token usage, session analytics
-and full-text context search.**
+**WakaTime for AI coding agents — token billing plus full-text conversation
+search, running entirely on your own machine.**
 
-One Parquet file · every agent · 100% local
+*You switch between three AI coding tools. Can you answer where this week's
+tokens actually went?*
 
-[简体中文说明](README.zh-CN.md) · [Issues](../../issues) · [License](LICENSE)
+**4.1 MB single binary · zero runtime deps · <100 MB resident · 43K turns indexed in 2s**
 
-**Rust** · **MIT** · **macOS / Linux** · **7 agents supported**
+[简体中文说明](README.zh-CN.md) · [Download a Release](../../releases) · [Issues](../../issues) · [MIT](LICENSE)
+
+**Rust** · **macOS / Linux** · **7 agents supported**
 
 </div>
 
 ---
 
-TokenBuddy watches the local session logs your AI coding tools already write,
-and turns them into **one queryable Parquet file** plus a fast little web
-dashboard: which tools and models you actually use, how many tokens (and cache
-hits, and credits) they burn, when you code — and a full-text search engine
-across **every conversation you have ever had with every agent**.
+TokenBuddy watches the local session logs your AI coding tools already write
+and turns them into **one queryable Parquet file** plus a web dashboard that
+opens instantly: which tools and models you actually use, how many tokens
+(and cache hits, and credits) they burn, when you code — and a full-text
+search engine across **every conversation you have ever had with every
+agent**.
 
-No cloud. No telemetry. No database server. One static Rust binary that binds
-to `127.0.0.1` only.
+No cloud. No telemetry. No accounts. Nothing to install. **A single static
+binary bound to `127.0.0.1` — privacy here is physics, not a setting.**
 
 ![TokenBuddy dashboard](docs/screenshot-dashboard.png)
+
+## The numbers
+
+| | |
+|---|---|
+| Single binary | **4.1 MB**, stripped, no runtime dependencies |
+| Full clean build | **48 s** (`cargo build --release`, no C++ toolchain) |
+| Server memory | **< 100 MB resident** with the full search index over 43K turns (older versions: 379 MB) |
+| First index build | 43K conversation turns in ≈ **2 s**, incremental after that |
+| Disk footprint | two Parquet files you can read, copy, `rm` |
+
+Every one of those is reproducible on your machine with
+`cargo run --release --example memprobe`. No embedded query engine, no
+third-party database — aggregation and search are pure Rust.
 
 ## Why
 
 Every AI coding tool keeps its own local logs — in its own format, in its own
-directory, useful to nobody. Once you run more than one agent, questions like
-these become unanswerable:
+directory, read by nobody after it is written. Once you run more than one
+agent, these questions become unanswerable:
 
-- How many tokens did I burn this week, and on which model?
+- How many tokens did I burn this week, on which model — and which
+  subscription is collecting dust?
+- What was my cache-hit rate? Is that context strategy I'm so proud of
+  actually working?
 - Which tool earns its keep — Claude Code, ZCode, Qoder, OpenCode…?
-- What was my cache-hit rate? Is my context strategy actually working?
-- *Where did I discuss that threading bug three weeks ago?* — in which tool,
-  which project, which session?
+- *Where did I discuss that threading bug three weeks ago?*
 
-TokenBuddy answers all of them, locally, with a single binary.
+TokenBuddy answers all of it, locally, with one binary.
 
 ## Features
 
-**Usage analytics**
+### 📊 One bill: every token accounted for
+
 Per-request input / output / cache-read / cache-creation tokens, duration and
 TTFT (where the source log reports it), plus host-reported credits for sources
-that mask token counts. Rollups by day/hour/week/month, by source, by model and
-by model family (`claude-sonnet-4-5-…` → `sonnet`). Period-over-period digest,
+that mask token counts. Rollups by day/hour/week/month, by source, by model,
+by model family (`claude-sonnet-4-5-…` → `sonnet`); period-over-period digest,
 source comparison, model heatmaps (model × source, model × date). Time buckets
 use a fixed UTC+8 offset — no DST surprises.
 
-**Full-text context search**
-A pure-Rust inverted index over user/assistant turns only — tool output and
-re-sent system context never enter the index, so cached boilerplate doesn't
-drown real conversations. Documents are content-hash deduplicated. Tokenizing
-is two-layer: ASCII tokens with prefix matching, and CJK character bigrams
-that catch matches across any word boundary; substring verification at query
-time is the precision layer. Candidates cascade from strict term-AND to
-IDF-weighted ranking, with click feedback and a search-quality panel. The
-index is compact by construction — doc text lives in a zstd-compressed arena
-decompressed per candidate, posting lists delta-varint-encoded in one flat
-arena, and metadata fully interned — so ~46K turns plus session digests index
-in about two seconds and the **whole server stays under 100 MB resident**
-(measured with `cargo run --release --example memprobe`).
+### 🔍 A time machine: search everything you ever told an agent
 
-**One local Parquet, every agent**
-All sources append into a single `~/.tokenbuddy/data.parquet` (Arrow schema, zstd).
-Every aggregation — summary, timeline, metrics, heatmaps, model tables — runs a
-pure-Rust path that projects only the columns it needs (~62% less read volume).
-No embedded query engine, no third-party runtime dependencies: the whole thing
-is one static Rust binary. Sync is incremental — already-seen records are
-skipped; full rebuilds keep rotated snapshots.
+The feature you cannot go back from. A pure-Rust inverted index over
+user/assistant turns only — tool output and re-sent system context never enter
+it, so cached boilerplate doesn't drown real conversations. Documents are
+content-hash deduplicated. Tokenizing is two-layer: ASCII tokens with prefix
+matching, plus CJK character bigrams that catch matches across any word
+boundary; substring verification at query time carries precision — **Chinese
+search without a dictionary** (jieba's 55 MB of resident dictionary was tried
+and removed; recall stayed, memory dropped). Candidates cascade from strict
+term-AND to IDF-weighted ranking, with click feedback and a quality panel.
 
-**A skill so your agent can analyze itself**
-[`skills/tokenbuddy-analyze/SKILL.md`](skills/tokenbuddy-analyze/SKILL.md) is a
-drop-in skill for any coding agent: point it at the local API and it can run
-token retrospectives, recover past discussions, and do daily self-reviews.
+Compact by construction: text lives in a zstd-compressed arena decompressed
+per candidate, posting lists are delta-varint-encoded into one flat arena,
+metadata is fully interned. 43K turns index in two seconds under 100 MB —
+a **"remember everything" retrieval system that runs on your laptop.**
 
-**Zero-friction privacy**
-The server binds to `127.0.0.1:8080`, never phones home, and the entire
-database is two files you can read, copy or `rm`. Your conversations never
-leave the machine.
+### 📦 One Parquet, every agent
+
+All sources append into a single `~/.tokenbuddy/data.parquet` (Arrow schema,
+zstd). Every aggregation runs a pure-Rust path projecting only the columns it
+needs (~62% less read volume). Sync is incremental — already-seen records are
+skipped; full rebuilds keep rotated snapshots. Each collector is one small
+file in `src/`: adding an agent is a community-friendly pull request, not a
+fork of the pipeline.
+
+### 🤖 A skill so your agent can analyze itself
+
+The corpus TokenBuddy builds is machine-readable. Drop in
+[`skills/tokenbuddy-analyze/SKILL.md`](skills/tokenbuddy-analyze/SKILL.md) and
+your coding agent talks to the local API directly: daily retrospectives, which
+flows keep repeating, what should become a skill or a repo rule. Combined with
+tiered summarization it costs 90% fewer tokens than feeding raw logs back to
+a model (see Agent self-evolution below).
+
+### 🔒 Zero-friction privacy
+
+The server binds to `127.0.0.1:8080`; the codebase contains no outbound
+network call, no config option that could export anything, no account. The
+entire database is two files. Delete `~/.tokenbuddy/` and TokenBuddy knows
+nothing about you again.
 
 ## Supported agents
 
@@ -94,13 +124,13 @@ leave the machine.
 | Mimo | `mimo` | |
 | Pi | `pi` | |
 
-Each collector is one small file in `src/` implementing "extract conversations
-+ token events from this tool's local logs". Adding an agent is a
-community-friendly pull request, not a fork of the pipeline.
-
 ## Quick start
 
-Requires Rust 1.75+.
+**Apple Silicon:** grab
+`tokenbuddy-v0.4.0-aarch64-apple-darwin.tar.gz` from
+[Releases](../../releases), unpack, run.
+
+**Any other platform, from source** (Rust 1.75+, ~48 s to build):
 
 ```bash
 git clone https://github.com/walker83/TokenBuddy.git
@@ -112,8 +142,8 @@ cargo b                     # build --release (alias defined in .cargo/config.to
 
 - The dashboard loads immediately; the first index build runs in the
   background (search reports its progress instead of pretending to be empty).
-- Hit the **Sync** button (or `POST /api/sync`) to pull the latest logs; the
-  context index refreshes alongside automatically.
+- Hit **Sync** (or `POST /api/sync`) to pull the latest logs; the context
+  index refreshes alongside automatically.
 - In the dashboard, <kbd>/</kbd> focuses the search box from anywhere.
 
 ## How it works
@@ -127,21 +157,16 @@ OpenCode     │                                (deduplicated turns)      invert
 Mimo / Pi  ──┘
 ```
 
-Everything on the right of the arrow is one process: collectors run on sync,
-Parquet is both the storage and the exchange format, aggregation and indexing
-are pure Rust, and the UI is a single HTML file compiled into the binary.
+Everything right of the arrow is one process: collectors run on sync, Parquet
+is both the storage and the exchange format, aggregation and indexing are
+pure Rust, and the UI is a single HTML file compiled into the binary.
 
 ## Agent self-evolution
 
-The corpus TokenBuddy builds is machine-readable, so your coding agent can
-consume it: point it at the local API (or read the Parquet directly) and ask
-for a daily retrospective — what got built, which flows keep repeating, what
-should become a skill or a repo rule.
-
-What makes this affordable is tiered summarization: ~80% of sessions are
-two-message throwaways that get a free rule-based digest (the first user
+What makes self-review affordable is tiered summarization: ~80% of sessions
+are two-message throwaways that get a free rule-based digest (the first user
 message *is* the intent), and only substantive sessions go to an LLM. On a
-real 3,391-session corpus this turned 4.2 MB of raw conversation into ~0.4 MB
+real 3,391-session corpus that turned 4.2 MB of raw conversation into ~0.4 MB
 of digests — **90% fewer tokens** than feeding raw logs back to a model, with
 every session still individually summarized (no sampling).
 
@@ -158,8 +183,7 @@ up three or more times is a skill candidate.
 | `~/.tokenbuddy/data.parquet.snapshots/` | rotated snapshots kept by full rebuilds (5 retained) |
 
 The HTTP API is local-only by construction. There is no config to leak, no
-account, no export target. Delete `~/.tokenbuddy/` and TokenBuddy knows nothing about
-you again.
+account, no export target.
 
 ## HTTP API
 
@@ -195,14 +219,14 @@ cargo test --release
 
 This repo builds release-only (debug artifacts once grew `target/` to 16 GB;
 the convention is enforced in `.cargo/config.toml` and [CLAUDE.md](CLAUDE.md)).
-Code layout: one `src/<tool>.rs` per collector, `store.rs` for Parquet +
-Rust parquet aggregation, `context.rs` for the search index, `main.rs` for
-the HTTP layer, and `src/dashboard.html` — the whole UI, embedded at compile
-time.
+Code layout: one `src/<tool>.rs` per collector, `store.rs` for Parquet I/O and
+aggregation, `context.rs` for the search index, `main.rs` for the HTTP layer,
+and `src/dashboard.html` — the whole UI, embedded at compile time.
 
 ## Roadmap
 
 - [ ] `cargo install` / Homebrew packaging
+- [ ] CI-published prebuilt binaries for Linux / Intel macOS
 - [ ] English UI toggle (dashboard is currently Chinese-first)
 - [ ] More agents: Cursor, Copilot CLI, Windsurf, Gemini CLI, …
 - [ ] Cost tables with configurable per-model pricing
