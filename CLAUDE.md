@@ -20,6 +20,24 @@ cargo test --release
 - 保持 `target/` 只保留 release 产物；如需深度清理，保留
   `target/release/tokenbuddy` 二进制即可。
 
+## 双远程发布纪律
+
+本仓库有两个远程：`origin`（内网，完整私有历史）和 `github`（公开，
+刻意整理过的干净历史，**不含 `analysis/`、`examples/test_sync.rs`、
+`docs/` 下的内部过程文档**）。**严禁直接 `git push github main`**——那会把
+私有历史连同 `analysis/` 里的会话数据一起推上去。发布到 GitHub 的正确流程：
+
+```bash
+git checkout -B public-release github/main
+git checkout main -- .cargo CLAUDE.md Cargo.lock Cargo.toml LICENSE README.md README.zh-CN.md docs/screenshot-dashboard.png src skills examples/memprobe.rs
+git rm src/tools.rs  # 若已删除
+git diff --cached main --stat -- . ':(exclude)analysis' ':(exclude)examples/test_sync.rs' ':(exclude)docs'  # 必须为空
+git commit ... && git push github public-release:main <tag>
+```
+
+发布前对暂存树跑一遍隐私扫描：
+`git grep -l -E "192\.168\.|walker@|ssh://git|密码[是为：]" -- .`
+
 ## 存储
 
 无查询引擎：所有来源写入同一份 `~/.tokenbuddy/data.parquet`，全部聚合
