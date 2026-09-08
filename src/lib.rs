@@ -7,7 +7,6 @@ pub mod qoder;
 pub mod workbuddy;
 pub mod store;
 pub mod context;
-pub mod tools;
 
 use chrono::Datelike;
 use serde::{Deserialize, Serialize};

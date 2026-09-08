@@ -286,15 +286,14 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
 /// Conversational text for context search. Qoder's session JSONL is
 /// Claude-shaped (`type: user|assistant` records, `message.content` a string
 /// or an array of typed parts), so extraction mirrors the claude collector.
-pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
+pub fn drain_messages(sink: &mut dyn FnMut(crate::context::ContextMessage)) {
     use crate::context::ContextMessage;
 
     let homes = get_qoder_homes();
     if homes.is_empty() {
-        return vec![];
+        return;
     }
 
-    let mut msgs = Vec::new();
     for home in &homes {
         for file_path in collect_session_files(&home.join("projects")) {
             let file = match fs::File::open(&file_path) {
@@ -352,7 +351,7 @@ pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
                     _ => String::new(),
                 };
                 if !text.trim().is_empty() {
-                    msgs.push(ContextMessage {
+                    sink(ContextMessage {
                         source: Source::Qoder,
                         session_id: session_id.clone(),
                         role,
@@ -365,7 +364,6 @@ pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
             }
         }
     }
-    msgs
 }
 
 // ============================================================
@@ -374,101 +372,11 @@ pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
 // simply yield nothing.
 // ============================================================
 
-pub fn collect_tool_events() -> Vec<crate::tools::ToolEvent> {
-    let homes = get_qoder_homes();
-    if homes.is_empty() {
-        return vec![];
-    }
-    let mut evs = Vec::new();
-    for home in &homes {
-        for file_path in collect_session_files(&home.join("projects")) {
-            let file = match fs::File::open(&file_path) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let fallback_session = file_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let mut session_id = String::new();
-            let mut use_names: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            for line_result in BufReader::new(file).lines() {
-                let Ok(line) = line_result else { continue };
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-                if session_id.is_empty() {
-                    session_id = value
-                        .get("sessionId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&fallback_session)
-                        .to_string();
-                }
-                if value.get("type").and_then(|t| t.as_str()) != Some("user")
-                    && value.get("type").and_then(|t| t.as_str()) != Some("assistant")
-                {
-                    continue;
-                }
-                let Some(message) = value.get("message") else { continue };
-                let timestamp = value
-                    .get("timestamp")
-                    .and_then(|v| v.as_str())
-                    .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-                    .map(|dt| dt.timestamp())
-                    .or_else(|| file_mtime(&file_path))
-                    .unwrap_or(0);
-                let Some(serde_json::Value::Array(parts)) = message.get("content") else { continue };
-                for part in parts {
-                    let Some(obj) = part.as_object() else { continue };
-                    match obj.get("type").and_then(|t| t.as_str()) {
-                        Some("tool_use") => {
-                            if let (Some(id), Some(name)) = (
-                                obj.get("id").and_then(|v| v.as_str()),
-                                obj.get("name").and_then(|v| v.as_str()),
-                            ) {
-                                use_names.insert(id.to_string(), name.to_string());
-                            }
-                        }
-                        Some("tool_result") => {
-                            let Some(tid) = obj.get("tool_use_id").and_then(|v| v.as_str()) else { continue };
-                            let text = render_tool_content(obj.get("content"));
-                            if text.trim().is_empty() {
-                                continue;
-                            }
-                            evs.push(crate::tools::ToolEvent {
-                                source: Source::Qoder,
-                                session_id: session_id.clone(),
-                                timestamp,
-                                tool_name: use_names.get(tid).cloned().unwrap_or_default(),
-                                block_key: tid.to_string(),
-                                text,
-                                is_error: obj.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-    evs
-}
 
-fn render_tool_content(content: Option<&serde_json::Value>) -> String {
-    match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(parts)) => {
-            let texts: Vec<&str> = parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect();
-            if !texts.is_empty() {
-                texts.join("\n")
-            } else {
-                serde_json::to_string(parts).unwrap_or_default()
-            }
-        }
-        Some(v) if v.is_object() => serde_json::to_string(v).unwrap_or_default(),
-        _ => String::new(),
-    }
+/// Collect into a vector; the sync path uses [`drain_messages`] so a source's
+/// messages are absorbed one at a time instead of all living at once.
+pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
+    let mut msgs = Vec::new();
+    drain_messages(&mut |m| msgs.push(m));
+    msgs
 }

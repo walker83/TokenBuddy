@@ -51,22 +51,31 @@ source comparison, model heatmaps (model × source, model × date). Time buckets
 use a fixed UTC+8 offset — no DST surprises.
 
 **Full-text context search**
-A pure-Rust, in-memory inverted index over user/assistant turns only — tool
-output and re-sent system context never enter the index, so cached boilerplate
-doesn't drown real conversations. Documents are content-hash deduplicated.
-Tokenizing is three-layer: ASCII tokens with prefix matching, jieba word
-segmentation for Chinese, and CJK character bigrams as a recall layer that
-catches matches crossing word boundaries. Candidates cascade from strict
-token-AND to bigram-AND to shared-token ranking, scored by IDF, with click
-feedback and a search-quality panel. An index of ~10⁵ turns builds in seconds
-and persists to Parquet.
+A pure-Rust inverted index over user/assistant turns only — tool output and
+re-sent system context never enter the index, so cached boilerplate doesn't
+drown real conversations. Documents are content-hash deduplicated. Tokenizing
+is two-layer: ASCII tokens with prefix matching, and CJK character bigrams
+that catch matches across any word boundary; substring verification at query
+time is the precision layer. Candidates cascade from strict term-AND to
+IDF-weighted ranking, with click feedback and a search-quality panel. The
+index is compact by construction — doc text lives in a zstd-compressed arena
+decompressed per candidate, posting lists delta-varint-encoded in one flat
+arena, and metadata fully interned — so ~46K turns plus session digests index
+in about two seconds and the **whole server stays under 100 MB resident**
+(measured with `cargo run --release --example memprobe`).
 
 **One local Parquet, every agent**
 All sources append into a single `~/.tokenbuddy/data.parquet` (Arrow schema, zstd).
-Summary/timeline queries go through DuckDB SQL over `read_parquet`; metrics,
-heatmaps and model tables use a pure-Rust aggregation path that projects only
-the columns it needs (~62% less read volume). Sync is incremental —
-already-seen records are skipped; full rebuilds keep rotated snapshots.
+Every aggregation — summary, timeline, metrics, heatmaps, model tables — runs a
+pure-Rust path that projects only the columns it needs (~62% less read volume).
+No embedded query engine, no third-party runtime dependencies: the whole thing
+is one static Rust binary. Sync is incremental — already-seen records are
+skipped; full rebuilds keep rotated snapshots.
+
+**A skill so your agent can analyze itself**
+[`skills/tokenbuddy-analyze/SKILL.md`](skills/tokenbuddy-analyze/SKILL.md) is a
+drop-in skill for any coding agent: point it at the local API and it can run
+token retrospectives, recover past discussions, and do daily self-reviews.
 
 **Zero-friction privacy**
 The server binds to `127.0.0.1:8080`, never phones home, and the entire
@@ -110,17 +119,17 @@ cargo b                     # build --release (alias defined in .cargo/config.to
 ## How it works
 
 ```
-Claude Code ─┐                            ┌─► ~/.tokenbuddy/data.parquet     ─► DuckDB SQL ─┐
-ZCode        │  local session logs        │                                          ├─► dashboard
-Qoder        ├─►  (each tool's own   ─►   │                                          │   127.0.0.1:8080
-WorkBuddy    │     format on disk)        └─► ~/.tokenbuddy/context.parquet ─► in-memory    │
+Claude Code ─┐                            ┌─► ~/.tokenbuddy/data.parquet  ─► pure-Rust agg ─┐
+ZCode        │  local session logs        │                                                   ├─► dashboard
+Qoder        ├─►  (each tool's own   ─►   │                                                   │   127.0.0.1:8080
+WorkBuddy    │     format on disk)        └─► ~/.tokenbuddy/context.parquet ─► in-memory      │
 OpenCode     │                                (deduplicated turns)      inverted idx ┘
 Mimo / Pi  ──┘
 ```
 
 Everything on the right of the arrow is one process: collectors run on sync,
-Parquet is both the storage and the exchange format, DuckDB is embedded, and
-the UI is a single HTML file compiled into the binary.
+Parquet is both the storage and the exchange format, aggregation and indexing
+are pure Rust, and the UI is a single HTML file compiled into the binary.
 
 ## Agent self-evolution
 
@@ -187,7 +196,7 @@ cargo test --release
 This repo builds release-only (debug artifacts once grew `target/` to 16 GB;
 the convention is enforced in `.cargo/config.toml` and [CLAUDE.md](CLAUDE.md)).
 Code layout: one `src/<tool>.rs` per collector, `store.rs` for Parquet +
-DuckDB + Rust aggregation, `context.rs` for the search index, `main.rs` for
+Rust parquet aggregation, `context.rs` for the search index, `main.rs` for
 the HTTP layer, and `src/dashboard.html` — the whole UI, embedded at compile
 time.
 

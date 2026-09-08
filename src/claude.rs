@@ -222,25 +222,26 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
 /// as they appear in the session JSONL. Tool results, tool_use blocks and
 /// sidechain (subagent) transcripts are skipped — they are the re-sent cached
 /// context that drowns real content.
-pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
+pub fn drain_messages(sink: &mut dyn FnMut(crate::context::ContextMessage)) {
     let projects_dir = get_claude_dir().join("projects");
     if !projects_dir.exists() {
-        return vec![];
+        return;
     }
 
-    let mut msgs = Vec::new();
     for file_path in collect_jsonl_files(&projects_dir) {
-        msgs.extend(extract_messages_from_file(&file_path));
+        for m in extract_messages_from_file(&file_path) {
+            sink(m);
+        }
     }
-    msgs
 }
 
 fn extract_messages_from_file(file_path: &Path) -> Vec<crate::context::ContextMessage> {
     use crate::context::ContextMessage;
 
+    let mut msgs = Vec::new();
     let file = match fs::File::open(file_path) {
         Ok(f) => f,
-        Err(_) => return vec![],
+        Err(_) => return msgs,
     };
     // projects/<munged-cwd>/<session>.jsonl — the directory is the project.
     let project = file_path
@@ -249,7 +250,6 @@ fn extract_messages_from_file(file_path: &Path) -> Vec<crate::context::ContextMe
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_string();
-    let mut msgs = Vec::new();
     let mut session_id = String::new();
     // Claude writes `{"type":"summary","summary":"…"}` lines naming the
     // session; that is the display title.
@@ -326,100 +326,11 @@ fn content_text(content: Option<&serde_json::Value>) -> String {
 // Tool events (R1 of the context-search blueprint)
 // ============================================================
 
-/// Tool blocks for the tool store. A session's JSONL carries each call once:
-/// the assistant's `tool_use` block (which owns the tool name) and the
-/// following user-turn `tool_result` block with the output. Pairing is by
-/// `tool_use_id`; sidechain turns are skipped like the conversation side.
-pub fn collect_tool_events() -> Vec<crate::tools::ToolEvent> {
-    let projects_dir = get_claude_dir().join("projects");
-    if !projects_dir.exists() {
-        return vec![];
-    }
-    let mut evs = Vec::new();
-    for file_path in collect_jsonl_files(&projects_dir) {
-        let file = match fs::File::open(&file_path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let mut session_id = String::new();
-        let mut use_names: HashMap<String, String> = HashMap::new();
-        for line_result in BufReader::new(file).lines() {
-            let Ok(line) = line_result else { continue };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-            if session_id.is_empty() {
-                if let Some(sid) = value.get("sessionId").and_then(|v| v.as_str()) {
-                    session_id = sid.to_string();
-                }
-            }
-            if value.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
-                continue;
-            }
-            if value.get("type").and_then(|t| t.as_str()) != Some("user")
-                && value.get("type").and_then(|t| t.as_str()) != Some("assistant")
-            {
-                continue;
-            }
-            let Some(message) = value.get("message") else { continue };
-            let timestamp = value
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-                .map(|dt| dt.timestamp())
-                .or_else(|| file_mtime(&file_path))
-                .unwrap_or(0);
-            let Some(serde_json::Value::Array(parts)) = message.get("content") else { continue };
-            for part in parts {
-                let Some(obj) = part.as_object() else { continue };
-                match obj.get("type").and_then(|t| t.as_str()) {
-                    Some("tool_use") => {
-                        if let (Some(id), Some(name)) = (
-                            obj.get("id").and_then(|v| v.as_str()),
-                            obj.get("name").and_then(|v| v.as_str()),
-                        ) {
-                            use_names.insert(id.to_string(), name.to_string());
-                        }
-                    }
-                    Some("tool_result") => {
-                        let Some(tid) = obj.get("tool_use_id").and_then(|v| v.as_str()) else { continue };
-                        let text = render_tool_content(obj.get("content"));
-                        if text.trim().is_empty() {
-                            continue;
-                        }
-                        evs.push(crate::tools::ToolEvent {
-                            source: Source::Claude,
-                            session_id: session_id.clone(),
-                            timestamp,
-                            tool_name: use_names.get(tid).cloned().unwrap_or_default(),
-                            block_key: tid.to_string(),
-                            text,
-                            is_error: obj.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    evs
-}
 
-/// `tool_result.content` is a string, an array of typed parts, or an object;
-/// text parts win, everything else serializes so the search still sees it.
-fn render_tool_content(content: Option<&serde_json::Value>) -> String {
-    match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(parts)) => {
-            let texts: Vec<&str> = parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect();
-            if !texts.is_empty() {
-                texts.join("\n")
-            } else {
-                serde_json::to_string(parts).unwrap_or_default()
-            }
-        }
-        Some(v) if v.is_object() => serde_json::to_string(v).unwrap_or_default(),
-        _ => String::new(),
-    }
+/// Collect into a vector; the sync path uses [`drain_messages`] so a source's
+/// messages are absorbed one at a time instead of all living at once.
+pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
+    let mut msgs = Vec::new();
+    drain_messages(&mut |m| msgs.push(m));
+    msgs
 }

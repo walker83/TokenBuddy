@@ -12,7 +12,7 @@ use parquet::arrow::ProjectionMask;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// How many pre-rebuild snapshots `sync_full` retains.
 const SNAPSHOT_KEEP: usize = 5;
@@ -478,8 +478,6 @@ fn default_column(data_type: &DataType, n: usize) -> Arc<dyn Array> {
 // --- Store ---
 
 pub struct Store {
-    duck_conn: Mutex<duckdb::Connection>,
-    _db_path: PathBuf,
     parquet_path: PathBuf,
 }
 
@@ -487,7 +485,7 @@ impl Store {
     pub fn open() -> Result<Self> {
         let base = get_store_dir();
         std::fs::create_dir_all(&base)?;
-        
+
         // Restrict permissions to owner-only (rwx------)
         #[cfg(unix)]
         {
@@ -499,7 +497,6 @@ impl Store {
             }
         }
 
-        let db_path = base.join("tokenbuddy.duckdb");
         let parquet_path = base.join("data.parquet");
 
         // Migrate old DataFusion parquet if needed
@@ -509,32 +506,21 @@ impl Store {
             let _ = std::fs::rename(&old_df_path, &parquet_path);
         }
 
-        let conn = duckdb::Connection::open(&db_path)?;
-        eprintln!("[TokenBuddy] Using DuckDB store");
+        // One-time cleanup: the DuckDB engine file outlived the engine —
+        // every query now aggregates straight from the parquet.
+        let _ = std::fs::remove_file(base.join("tokenbuddy.duckdb"));
         migrate_parquet_schema(&parquet_path)?;
 
-        Ok(Self {
-            duck_conn: Mutex::new(conn),
-            _db_path: db_path,
-            parquet_path,
-        })
-    }
-
-    fn pq(&self) -> String {
-        self.parquet_path.to_string_lossy().to_string()
+        Ok(Self { parquet_path })
     }
 
     pub fn record_count(&self) -> Result<u64> {
         if !self.parquet_path.exists() {
             return Ok(0);
         }
-        let conn = self.duck_conn.lock().unwrap_or_else(|e| e.into_inner());
-        let count: u64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM read_parquet('{}')", self.pq()),
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count)
+        let file = std::fs::File::open(&self.parquet_path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        Ok(builder.metadata().file_metadata().num_rows().max(0) as u64)
     }
 
     pub fn sync(&self) -> Result<SyncResult> {
@@ -620,79 +606,8 @@ impl Store {
         let summary = if !self.parquet_path.exists() {
             empty_summary()
         } else {
-            let conn = self.duck_conn.lock().unwrap_or_else(|e| e.into_inner());
-            let from = format!("read_parquet('{}')", self.pq());
-            let wc = build_where(source, model, date_start, date_end);
-
-            let (total_requests, ti, to, tcr, tcc, credits): (u64, u64, u64, u64, u64, f64) = conn.query_row(
-                &format!(
-                    "SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                            COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
-                            COALESCE(SUM(credits),0.0)
-                     FROM {from} {}", wc.sql
-                ), duckdb::params_from_iter(&wc.params),
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-            )?;
-
-            let mut by_source = Vec::new();
-            {
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT source, COUNT(*), COALESCE(SUM(input_tokens),0),
-                            COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read_tokens),0),
-                            COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(credits),0.0)
-                     FROM {from} {} GROUP BY source ORDER BY source", wc.sql
-                ))?;
-                let rows = stmt.query_map(duckdb::params_from_iter(&wc.params), |row| {
-                    Ok(SourceRow {
-                        source: row.get(0)?,
-                        requests: row.get::<_, i64>(1)? as u64,
-                        input_tokens: row.get::<_, i64>(2)? as u64,
-                        output_tokens: row.get::<_, i64>(3)? as u64,
-                        cache_read_tokens: row.get::<_, i64>(4)? as u64,
-                        cache_creation_tokens: row.get::<_, i64>(5)? as u64,
-                        credits: row.get::<_, f64>(6)?,
-                    })
-                })?;
-                for r in rows { by_source.push(r?); }
-            }
-
-            let mut by_model = Vec::new();
-            {
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT source, model, COUNT(*),
-                            COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                            COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0),
-                            COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_creation_tokens),0),
-                            COALESCE(SUM(credits),0.0)
-                     FROM {from} {} GROUP BY source, model ORDER BY 8 DESC", wc.sql
-                ))?;
-                let rows = stmt.query_map(duckdb::params_from_iter(&wc.params), |row| {
-                    Ok(ModelRow {
-                        source: row.get(0)?,
-                        model: row.get(1)?,
-                        requests: row.get::<_, i64>(2)? as u64,
-                        input_tokens: row.get::<_, i64>(3)? as u64,
-                        output_tokens: row.get::<_, i64>(4)? as u64,
-                        cache_read_tokens: row.get::<_, i64>(5)? as u64,
-                        cache_creation_tokens: row.get::<_, i64>(6)? as u64,
-                        total_tokens: row.get::<_, i64>(7)? as u64,
-                        credits: row.get::<_, f64>(8)?,
-                    })
-                })?;
-                for r in rows { by_model.push(r?); }
-            }
-
-            Summary {
-                total_requests,
-                total_input_tokens: ti,
-                total_output_tokens: to,
-                total_cache_read_tokens: tcr,
-                total_cache_creation_tokens: tcc,
-                total_tokens: ti + to + tcr + tcc,
-                total_credits: credits,
-                by_source,
-                by_model,
-            }
+            let batches = rust_read_agg_columns(&self.parquet_path)?;
+            rust_compute_summary(&batches, source, model, date_start, date_end)?
         };
         Ok(summary)
     }
@@ -708,10 +623,8 @@ impl Store {
         let buckets = if !self.parquet_path.exists() {
             vec![]
         } else {
-            let conn = self.duck_conn.lock().unwrap_or_else(|e| e.into_inner());
-            let from = format!("read_parquet('{}')", self.pq());
-            let wc = build_where(source, model, date_start, date_end);
-            duck_timeline_query(&conn, &from, &wc, mode)?
+            let batches = rust_read_agg_columns(&self.parquet_path)?;
+            rust_compute_timeline(&batches, mode, source, model, date_start, date_end)?
         };
         Ok(buckets)
     }
@@ -892,41 +805,8 @@ fn empty_summary() -> Summary {
     }
 }
 
-/// Filter conditions plus the bound values for parameterised queries.
-struct WhereClause {
-    sql: String,
-    params: Vec<duckdb::types::Value>,
-}
-
-fn build_where(source: Option<&str>, model: Option<&str>, date_start: Option<i64>, date_end: Option<i64>) -> WhereClause {
-    let mut conds = Vec::new();
-    let mut params = Vec::new();
-    if let Some(s) = source {
-        conds.push("source = ?");
-        params.push(duckdb::types::Value::Text(s.to_string()));
-    }
-    if let Some(m) = model {
-        conds.push("model LIKE ?");
-        params.push(duckdb::types::Value::Text(format!("%{m}%")));
-    }
-    if let Some(ds) = date_start {
-        conds.push("timestamp >= ?");
-        params.push(duckdb::types::Value::BigInt(ds));
-    }
-    if let Some(de) = date_end {
-        conds.push("timestamp < ?");
-        params.push(duckdb::types::Value::BigInt(de));
-    }
-    let sql = if conds.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conds.join(" AND "))
-    };
-    WhereClause { sql, params }
-}
-
-/// Rewrite `data.parquet` when it was written by an older schema so the SQL
-/// queries, which name every column, work before the next sync.
+/// Rewrite `data.parquet` when it was written by an older schema so the
+/// aggregators, which name every column, work before the next sync.
 fn migrate_parquet_schema(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -949,77 +829,6 @@ fn migrate_parquet_schema(path: &Path) -> Result<()> {
         .map(|b| align_batch(b, &want))
         .collect::<Result<_>>()?;
     write_parquet(path, &concat_batches(&want, &aligned)?)
-}
-
-// Bucket-label expressions shared by the aggregate timeline query so every
-// granularity produces consistent labels.
-
-/// Bucket label expression for the given granularity. The epoch is shifted by
-/// the China offset *before* formatting so buckets break at 00:00 CST; the
-/// stored `timestamp` column stays true UTC.
-fn duck_trunc(mode: TimelineMode) -> String {
-    let shift = format!("to_timestamp(timestamp + {})", crate::CN_OFFSET_SECS);
-    let fmt = match mode {
-        TimelineMode::Hourly => "'%Y-%m-%d %H:00'",
-        TimelineMode::Daily => "'%Y-%m-%d'",
-        TimelineMode::Weekly => "'%Y-W%W'",
-        TimelineMode::Monthly => "'%Y-%m'",
-    };
-    format!("strftime(CAST({shift} AS TIMESTAMP), {fmt})")
-}
-
-fn duck_timeline_query(
-    conn: &duckdb::Connection,
-    from: &str,
-    wc: &WhereClause,
-    mode: TimelineMode,
-) -> Result<Vec<TimelineBucket>> {
-    let trunc = duck_trunc(mode);
-    let sql = format!(
-        "SELECT {trunc} as label,
-                COUNT(*) as requests,
-                COALESCE(SUM(input_tokens),0),
-                COALESCE(SUM(output_tokens),0),
-                COALESCE(SUM(cache_read_tokens),0),
-                COALESCE(SUM(cache_creation_tokens),0),
-                COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_creation_tokens),0),
-                COALESCE(SUM(CASE WHEN source='claude' THEN input_tokens+output_tokens+cache_read_tokens+cache_creation_tokens ELSE 0 END),0),
-                COALESCE(SUM(CASE WHEN source='opencode' THEN input_tokens+output_tokens+cache_read_tokens+cache_creation_tokens ELSE 0 END),0),
-                COALESCE(SUM(CASE WHEN source='mimo' THEN input_tokens+output_tokens+cache_read_tokens+cache_creation_tokens ELSE 0 END),0),
-                COALESCE(SUM(CASE WHEN source='zcode' THEN input_tokens+output_tokens+cache_read_tokens+cache_creation_tokens ELSE 0 END),0),
-                COALESCE(SUM(CASE WHEN source='pi' THEN input_tokens+output_tokens+cache_read_tokens+cache_creation_tokens ELSE 0 END),0),
-                COALESCE(SUM(CASE WHEN source='qoder' THEN input_tokens+output_tokens+cache_read_tokens+cache_creation_tokens ELSE 0 END),0),
-                COALESCE(SUM(CASE WHEN source='workbuddy' THEN input_tokens+output_tokens+cache_read_tokens+cache_creation_tokens ELSE 0 END),0)
-         FROM {from} {}
-         GROUP BY label ORDER BY label",
-        wc.sql
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(duckdb::params_from_iter(&wc.params), |row| {
-        Ok(TimelineBucket {
-            label: row.get::<_, String>(0)?,
-            requests: row.get::<_, i64>(1)? as u64,
-            input_tokens: row.get::<_, i64>(2)? as u64,
-            output_tokens: row.get::<_, i64>(3)? as u64,
-            cache_read_tokens: row.get::<_, i64>(4)? as u64,
-            cache_creation_tokens: row.get::<_, i64>(5)? as u64,
-            total_tokens: row.get::<_, i64>(6)? as u64,
-            claude_tokens: row.get::<_, i64>(7)? as u64,
-            opencode_tokens: row.get::<_, i64>(8)? as u64,
-            mimo_tokens: row.get::<_, i64>(9)? as u64,
-            zcode_tokens: row.get::<_, i64>(10)? as u64,
-            pi_tokens: row.get::<_, i64>(11)? as u64,
-            qoder_tokens: row.get::<_, i64>(12)? as u64,
-            workbuddy_tokens: row.get::<_, i64>(13)? as u64,
-        })
-    })?;
-
-    let mut buckets = Vec::new();
-    for r in rows {
-        buckets.push(r?);
-    }
-    Ok(buckets)
 }
 
 fn get_store_dir() -> PathBuf {
@@ -1103,6 +912,238 @@ fn col_f64(batch: &RecordBatch, name: &str, i: usize) -> f64 {
         .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
         .map(|a| a.value(i))
         .unwrap_or(0.0)
+}
+
+// --- Summary (totals + by source + by source×model) ---
+
+/// Row filter shared by the engine-free aggregations: source equality,
+/// substring model match (what the dashboard's model filter sends), and the
+/// [start, end) timestamp window the HTTP filters describe.
+#[inline]
+fn row_passes(src: &str, mdl: &str, ts: i64, source: Option<&str>, model: Option<&str>, ds: Option<i64>, de: Option<i64>) -> bool {
+    if let Some(s) = source {
+        if src != s {
+            return false;
+        }
+    }
+    if let Some(m) = model {
+        if !mdl.contains(m) {
+            return false;
+        }
+    }
+    if let Some(d) = ds {
+        if ts < d {
+            return false;
+        }
+    }
+    if let Some(d) = de {
+        if ts >= d {
+            return false;
+        }
+    }
+    true
+}
+
+#[derive(Default)]
+struct SumAcc {
+    requests: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+    credits: f64,
+}
+
+impl SumAcc {
+    #[inline]
+    fn add(&mut self, inp: u64, out: u64, cr: u64, cw: u64, credits: f64) {
+        self.requests += 1;
+        self.input_tokens += inp;
+        self.output_tokens += out;
+        self.cache_read_tokens += cr;
+        self.cache_creation_tokens += cw;
+        self.credits += credits;
+    }
+    fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_creation_tokens
+    }
+}
+
+fn rust_compute_summary(
+    batches: &[RecordBatch],
+    source_filter: Option<&str>,
+    model_filter: Option<&str>,
+    ds: Option<i64>,
+    de: Option<i64>,
+) -> Result<Summary> {
+    let mut total = SumAcc::default();
+    // BTreeMap: the API contract is rows ordered by source, matching the
+    // ORDER BY the SQL path had.
+    let mut by_source: std::collections::BTreeMap<String, SumAcc> = std::collections::BTreeMap::new();
+    let mut by_model: HashMap<(String, String), SumAcc> = HashMap::new();
+
+    for batch in batches {
+        let n = batch.num_rows();
+        for i in 0..n {
+            let src = col_str(batch, "source", i);
+            let mdl = col_str(batch, "model", i);
+            let ts = col_i64(batch, "timestamp", i);
+            if !row_passes(src, mdl, ts, source_filter, model_filter, ds, de) {
+                continue;
+            }
+            let inp = col_i64(batch, "input_tokens", i) as u64;
+            let out = col_i64(batch, "output_tokens", i) as u64;
+            let cr = col_i64(batch, "cache_read_tokens", i) as u64;
+            let cw = col_i64(batch, "cache_creation_tokens", i) as u64;
+            let credits = col_f64(batch, "credits", i);
+            total.add(inp, out, cr, cw, credits);
+            by_source.entry(src.to_string()).or_default().add(inp, out, cr, cw, credits);
+            by_model
+                .entry((src.to_string(), mdl.to_string()))
+                .or_default()
+                .add(inp, out, cr, cw, credits);
+        }
+    }
+
+    let mut model_rows: Vec<ModelRow> = by_model
+        .into_iter()
+        .map(|((source, model), a)| ModelRow {
+            source,
+            model,
+            requests: a.requests,
+            input_tokens: a.input_tokens,
+            output_tokens: a.output_tokens,
+            cache_read_tokens: a.cache_read_tokens,
+            cache_creation_tokens: a.cache_creation_tokens,
+            total_tokens: a.total_tokens(),
+            credits: a.credits,
+        })
+        .collect();
+    // Total-volume desc, the SQL path's ORDER BY; the tie-break keeps the
+    // order stable where the engine never promised one.
+    model_rows.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens).then(a.source.cmp(&b.source)).then(a.model.cmp(&b.model)));
+
+    Ok(Summary {
+        total_requests: total.requests,
+        total_input_tokens: total.input_tokens,
+        total_output_tokens: total.output_tokens,
+        total_cache_read_tokens: total.cache_read_tokens,
+        total_cache_creation_tokens: total.cache_creation_tokens,
+        total_tokens: total.total_tokens(),
+        total_credits: total.credits,
+        by_source: by_source
+            .into_iter()
+            .map(|(source, a)| SourceRow {
+                source,
+                requests: a.requests,
+                input_tokens: a.input_tokens,
+                output_tokens: a.output_tokens,
+                cache_read_tokens: a.cache_read_tokens,
+                cache_creation_tokens: a.cache_creation_tokens,
+                credits: a.credits,
+            })
+            .collect(),
+        by_model: model_rows,
+    })
+}
+
+// --- Timeline buckets ---
+
+/// The per-source split the timeline carries, in `TimelineBucket` field
+/// order; the index into `Acc.src` comes from `TIMELINE_SOURCES`.
+const TIMELINE_SOURCES: [&str; 7] = [
+    "claude", "opencode", "mimo", "zcode", "pi", "qoder", "workbuddy",
+];
+
+#[derive(Default)]
+struct TimelineAcc {
+    requests: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+    src: [u64; 7],
+}
+
+/// Bucket label for one granularity, matching the SQL expressions the
+/// engine-free path replaced: the epoch shifts to China time before
+/// formatting so buckets break at 00:00 CST, and weekly follows strftime
+/// `%W` — week 1 opens at the year's first Monday, earlier days are week 00.
+fn bucket_label(mode: TimelineMode, ts: i64) -> String {
+    use chrono::{Datelike, Timelike};
+    let shifted = ts + crate::CN_OFFSET_SECS;
+    let t = chrono::DateTime::from_timestamp(shifted, 0)
+        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).expect("epoch is valid"))
+        .naive_utc();
+    match mode {
+        TimelineMode::Hourly => format!("{} {:02}:00", t.format("%Y-%m-%d"), t.hour()),
+        TimelineMode::Daily => t.format("%Y-%m-%d").to_string(),
+        TimelineMode::Weekly => {
+            let yday = t.ordinal0() as i64; // 0-based day of year
+            let wday_m = t.weekday().num_days_from_monday() as i64;
+            let week = (yday - wday_m + 7) / 7;
+            format!("{}-W{:02}", t.year(), week)
+        }
+        TimelineMode::Monthly => t.format("%Y-%m").to_string(),
+    }
+}
+
+fn rust_compute_timeline(
+    batches: &[RecordBatch],
+    mode: TimelineMode,
+    source_filter: Option<&str>,
+    model_filter: Option<&str>,
+    ds: Option<i64>,
+    de: Option<i64>,
+) -> Result<Vec<TimelineBucket>> {
+    let mut map: HashMap<String, TimelineAcc> = HashMap::new();
+    for batch in batches {
+        let n = batch.num_rows();
+        for i in 0..n {
+            let src = col_str(batch, "source", i);
+            let mdl = col_str(batch, "model", i);
+            let ts = col_i64(batch, "timestamp", i);
+            if !row_passes(src, mdl, ts, source_filter, model_filter, ds, de) {
+                continue;
+            }
+            let inp = col_i64(batch, "input_tokens", i) as u64;
+            let out = col_i64(batch, "output_tokens", i) as u64;
+            let cr = col_i64(batch, "cache_read_tokens", i) as u64;
+            let cw = col_i64(batch, "cache_creation_tokens", i) as u64;
+            let slot = TIMELINE_SOURCES.iter().position(|s| *s == src);
+            let acc = map.entry(bucket_label(mode, ts)).or_default();
+            acc.requests += 1;
+            acc.input_tokens += inp;
+            acc.output_tokens += out;
+            acc.cache_read_tokens += cr;
+            acc.cache_creation_tokens += cw;
+            if let Some(k) = slot {
+                acc.src[k] += inp + out + cr + cw;
+            }
+        }
+    }
+    // Label sort == chronological sort for every granularity's format.
+    let mut labeled: Vec<(String, TimelineAcc)> = map.into_iter().collect();
+    labeled.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(labeled
+        .into_iter()
+        .map(|(label, a)| TimelineBucket {
+            label,
+            requests: a.requests,
+            input_tokens: a.input_tokens,
+            output_tokens: a.output_tokens,
+            cache_read_tokens: a.cache_read_tokens,
+            cache_creation_tokens: a.cache_creation_tokens,
+            total_tokens: a.input_tokens + a.output_tokens + a.cache_read_tokens + a.cache_creation_tokens,
+            claude_tokens: a.src[0],
+            opencode_tokens: a.src[1],
+            mimo_tokens: a.src[2],
+            zcode_tokens: a.src[3],
+            pi_tokens: a.src[4],
+            qoder_tokens: a.src[5],
+            workbuddy_tokens: a.src[6],
+        })
+        .collect())
 }
 
 // --- Per-source aggregate metrics ---
@@ -1349,6 +1390,36 @@ fn rust_compute_heatmap(batches: &[RecordBatch], mode: &str, metric: &str, sourc
 mod tests {
     use super::*;
     use crate::Source;
+
+    #[test]
+    fn timeline_labels_match_the_sql_formats() {
+        // 2026-09-08 21:35 CST (1_788_874_500 is 13:35 UTC).
+        let ts = 1_788_874_500;
+        assert_eq!(bucket_label(TimelineMode::Hourly, ts), "2026-09-08 21:00");
+        assert_eq!(bucket_label(TimelineMode::Daily, ts), "2026-09-08");
+        assert_eq!(bucket_label(TimelineMode::Weekly, ts), "2026-W36");
+        assert_eq!(bucket_label(TimelineMode::Monthly, ts), "2026-09");
+        // Buckets break at 00:00 CST, not UTC midnight: 15:59 UTC is still
+        // 23:59 of the same CST day, 16:00 UTC opens the next one.
+        assert_eq!(bucket_label(TimelineMode::Daily, 1_788_883_199), bucket_label(TimelineMode::Daily, ts));
+        assert_ne!(bucket_label(TimelineMode::Daily, 1_788_883_200), bucket_label(TimelineMode::Daily, ts));
+    }
+
+    #[test]
+    fn weekly_labels_follow_strftime_w_semantics_across_year_edges() {
+        // %W: week 1 opens at the year's first Monday; earlier days are
+        // week 00 of that calendar year. 2027-01-01 is a Friday → W00.
+        let jan1_2027 = 1_798_761_600 + 12 * 3600;
+        assert_eq!(bucket_label(TimelineMode::Weekly, jan1_2027), "2027-W00");
+        // 2024-01-01 was a Monday → week 1 immediately.
+        let jan1_2024 = 1_704_067_200 + 12 * 3600;
+        assert_eq!(bucket_label(TimelineMode::Weekly, jan1_2024), "2024-W01");
+        // 2026-01-01 was a Thursday → W00; first Monday 2026-01-05 → W01.
+        let jan1_2026 = 1_767_225_600 + 12 * 3600;
+        let jan5_2026 = 1_767_571_200 + 12 * 3600;
+        assert_eq!(bucket_label(TimelineMode::Weekly, jan1_2026), "2026-W00");
+        assert_eq!(bucket_label(TimelineMode::Weekly, jan5_2026), "2026-W01");
+    }
 
     fn rec(source: Source, ts: i64, input: u64, record_id: Option<&str>) -> TokenRecord {
         TokenRecord {

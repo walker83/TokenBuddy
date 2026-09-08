@@ -1010,7 +1010,7 @@ function renderContextStatus() {
   const idx = ctxStats.index;
   if (s.phase === 'ready' && idx) {
     const src = Object.entries(idx.by_source || {}).map(([k, v]) => `${SRC_NAMES[k] || k} ${v}`).join(' · ');
-    el.innerHTML = `<span class="ok">● 索引就绪</span>：${idx.docs.toLocaleString()} 条对话（${src}），检索词表 ${idx.ascii_terms.toLocaleString()} + jieba 词 ${idx.cjk_words.toLocaleString()} + 中文 bigram ${idx.cjk_grams.toLocaleString()}，约 ${(idx.approx_bytes / 1048576).toFixed(1)} MB，构建耗时 ${(idx.build_ms / 1000).toFixed(1)}s`;
+    el.innerHTML = `<span class="ok">● 索引就绪</span>：${idx.docs.toLocaleString()} 条对话（${src}），检索词表 ${idx.ascii_terms.toLocaleString()} + 中文 bigram ${idx.cjk_grams.toLocaleString()}，约 ${(idx.approx_bytes / 1048576).toFixed(1)} MB，构建耗时 ${(idx.build_ms / 1000).toFixed(1)}s`;
     populateProjectSelect(idx.by_project || {});
   } else if (s.phase === 'failed') {
     el.innerHTML = `<span class="bad">● 索引失败</span>：${esc(s.detail || '未知错误')}`;
@@ -1372,7 +1372,6 @@ function hitCardHtml(r, i, terms) {
       <button class="ctx-expand hit-copy" title="复制本条内容" onclick="copyHit(this, ${i});event.stopPropagation()">⧉ 复制</button>
       <span class="sess" title="${esc(r.title ? r.title + ' · ' : '')}会话 ${esc(r.session_id)}">${r.title ? esc(r.title) + ' · ' : ''}${esc(r.session_id)}</span>
       ${r.truncated ? '<span class="ctx-truncated">内容超长，仅索引前段</span>' : ''}
-      ${r.equivalent > 0 ? `<span class="ctx-truncated" title="其他会话/轮次出现过相同输出，已合并">＋${r.equivalent} 条同内容</span>` : ''}
       <span class="score">${r.score.toFixed(2)}</span>
     </div>
     <div class="ctx-snippet">${mdSnippet(r.snippet, terms)}</div>

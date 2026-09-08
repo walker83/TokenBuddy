@@ -269,15 +269,14 @@ mod tests {
 /// template quoting itself. Assistant replies sit in `toolOutput` as
 /// chat.completion JSON (`choices[].message.content`, string content only —
 /// tool-call turns carry `null`).
-pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
+pub fn drain_messages(sink: &mut dyn FnMut(crate::context::ContextMessage)) {
     use crate::context::ContextMessage;
 
     let traces_dir = get_workbuddy_dir().join("traces");
     if !traces_dir.exists() {
-        return vec![];
+        return;
     }
 
-    let mut msgs = Vec::new();
     for file_path in collect_trace_files(&traces_dir) {
         let Ok(text) = fs::read_to_string(&file_path) else { continue };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&repair_lone_surrogates(&text))
@@ -308,7 +307,7 @@ pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
                 if !query.trim().is_empty() {
                     // WorkBuddy traces carry no working directory; the
                     // project stays unknown for this source.
-                    msgs.push(ContextMessage {
+                    sink(ContextMessage {
                         source: Source::WorkBuddy,
                         session_id: session_id.clone(),
                         role: "user",
@@ -322,7 +321,7 @@ pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
 
             if let Some(reply) = assistant_reply(span.get("toolOutput").and_then(|v| v.as_str())) {
                 if !reply.trim().is_empty() {
-                    msgs.push(ContextMessage {
+                    sink(ContextMessage {
                         source: Source::WorkBuddy,
                         session_id: session_id.clone(),
                         role: "assistant",
@@ -335,7 +334,6 @@ pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
             }
         }
     }
-    msgs
 }
 
 /// The text of the final `<user_query>` block, scanning from the end so the
@@ -394,65 +392,11 @@ fn unescape_prompt_literals(text: &str) -> String {
 // where it gets structured.
 // ============================================================
 
-pub fn collect_tool_events() -> Vec<crate::tools::ToolEvent> {
-    let traces_dir = get_workbuddy_dir().join("traces");
-    if !traces_dir.exists() {
-        return vec![];
-    }
-    let mut evs = Vec::new();
-    for file_path in collect_trace_files(&traces_dir) {
-        let Ok(text) = fs::read_to_string(&file_path) else { continue };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&repair_lone_surrogates(&text))
-        else {
-            continue;
-        };
-        let Some(spans) = value.get("spans").and_then(|v| v.as_array()) else { continue };
-        let session_id = value
-            .get("trace")
-            .and_then(|t| t.get("sessionId").or_else(|| t.get("traceId")))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        for span in spans {
-            if span.get("type").and_then(|t| t.as_str()) != Some("function") {
-                continue;
-            }
-            let Some(span_id) = span.get("spanId").and_then(|v| v.as_str()) else { continue };
-            let output = span
-                .get("toolOutput")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let input = span
-                .get("toolInput")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let text = if output.trim().is_empty() { input.to_string() } else { output.to_string() };
-            if text.trim().is_empty() {
-                continue;
-            }
-            let status_ok = span.get("status").and_then(|v| v.as_str()) != Some("ok");
-            let has_error = span.get("error").map_or(false, |e| !e.is_null());
-            evs.push(crate::tools::ToolEvent {
-                source: Source::WorkBuddy,
-                session_id: session_id.clone(),
-                timestamp: span
-                    .get("startedAt")
-                    .and_then(|ts| ts.as_str())
-                    .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-                    .map(|dt| dt.timestamp())
-                    .or_else(|| file_mtime(&file_path))
-                    .unwrap_or(0),
-                tool_name: span
-                    .get("toolName")
-                    .or_else(|| span.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                block_key: span_id.to_string(),
-                text,
-                is_error: status_ok || has_error,
-            });
-        }
-    }
-    evs
+
+/// Collect into a vector; the sync path uses [`drain_messages`] so a source's
+/// messages are absorbed one at a time instead of all living at once.
+pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
+    let mut msgs = Vec::new();
+    drain_messages(&mut |m| msgs.push(m));
+    msgs
 }

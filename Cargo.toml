@@ -3,7 +3,7 @@ name = "tokenbuddy"
 description = "TokenBuddy — local-first token usage, session analytics and full-text context search for AI coding agents"
 license = "MIT"
 repository = "https://github.com/walker83/TokenBuddy"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75"
 
@@ -17,12 +17,11 @@ serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 rusqlite = { version = "0.31" }
-duckdb = { version = "1.1", features = ["bundled"] }
 arrow = "58"
 parquet = { version = "58", features = ["zstd"] }
 anyhow = "1"
 tiny_http = "0.12"
-jieba-rs = { version = "0.7", features = ["default-dict"] }
+zstd = "0.13"
 
 [lib]
 name = "tokenbuddy"

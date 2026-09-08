@@ -46,17 +46,25 @@ TokenBuddy 在本地回答以上全部问题，只需要一个二进制。
 分桶使用固定 UTC+8——没有夏令时的坑。
 
 **全文上下文搜索**
-纯 Rust 内存倒排索引，只索引 user/assistant 对话轮——工具输出、system 重发
-上下文一律不进索引，重复缓存不会淹没搜索结果。文档按内容哈希去重。分词三层：
-ASCII 词元支持前缀模糊、jieba 负责中文词粒度、CJK 字符 bigram 兜底跨词边界的
-片段查询。候选级联：词元 AND → bigram AND → 共享词元排序，IDF 加权，带点击
-反馈与搜索质量面板。十万轮量级的索引几秒建完，持久化到 Parquet。
+纯 Rust 倒排索引，只索引 user/assistant 对话轮——工具输出、system 重发
+上下文一律不进索引，重复缓存不会淹没搜索结果。文档按内容哈希去重。分词两层：
+ASCII 词元支持前缀模糊，CJK 字符 bigram 兜底跨词边界的片段查询；查询期的
+子串复验负责精度。候选级联：内容词 AND → IDF 加权排序，带点击反馈与搜索
+质量面板。索引天生紧凑——正文压缩进 zstd arena 按候选解压、postings 以
+delta-varint 编码进单一平坦 arena、元数据全部驻留内化——4.6 万轮对话加会话
+摘要约两秒建完，**整个服务常驻内存 100 MB 以内**（实测方式见
+`cargo run --release --example memprobe`）。
 
 **一份 Parquet，装下所有工具**
-所有来源写入同一个 `~/.tokenbuddy/data.parquet`（Arrow schema，zstd 压缩）。
-summary / timeline 走 DuckDB SQL 查 `read_parquet`；metrics / 热力图 / 模型表
-走纯 Rust 聚合路径，只投影需要的列（读取量省约 62%）。同步是增量的——
-见过的记录自动跳过；全量重建保留轮转快照。
+所有来源写入同一个 `~/.tokenbuddy/data.parquet`（Arrow schema，zstd 压缩），
+聚合全部走纯 Rust 路径，只投影需要的列（读取量省约 62%）——没有内嵌查询
+引擎，没有第三方运行时依赖。同步是增量的——见过的记录自动跳过；全量重建
+保留轮转快照。
+
+**给 AI 用的分析 skill**
+[`skills/tokenbuddy-analyze/SKILL.md`](skills/tokenbuddy-analyze/SKILL.md) 可以
+直接装进任何编码 Agent：指向本地 API，它就能做 Token 复盘、找回历史讨论、
+每日自我进化。
 
 **零负担的隐私**
 服务只绑定 `127.0.0.1:8080`，从不外呼；整个"数据库"就是两个文件，可读、
@@ -98,16 +106,16 @@ cargo b                     # 即 build --release（别名见 .cargo/config.toml
 ## 工作原理
 
 ```
-Claude Code ─┐                            ┌─► ~/.tokenbuddy/data.parquet     ─► DuckDB SQL ─┐
-ZCode        │  本地会话日志               │                                          ├─► 仪表盘
-Qoder        ├─►  （各工具自己的      ─►  │                                          │   127.0.0.1:8080
-WorkBuddy    │     格式与目录）           └─► ~/.tokenbuddy/context.parquet ─► 内存倒排索引  ┘
+Claude Code ─┐                            ┌─► ~/.tokenbuddy/data.parquet  ─► 纯 Rust 聚合    ─┐
+ZCode        │  本地会话日志               │                                                   ├─► 仪表盘
+Qoder        ├─►  （各工具自己的      ─►  │                                                   │   127.0.0.1:8080
+WorkBuddy    │     格式与目录）           └─► ~/.tokenbuddy/context.parquet ─► 内存倒排索引     ┘
 OpenCode     │                                （去重后的对话轮）
 Mimo / Pi  ──┘
 ```
 
-箭头右边是一个进程：同步时运行采集器，Parquet 既是存储也是交换格式，DuckDB
-以内嵌方式运行，UI 是编译期打进二进制的单个 HTML 文件。
+箭头右边是一个进程：同步时运行采集器，Parquet 既是存储也是交换格式，聚合与
+索引全在纯 Rust 里完成，UI 是编译期打进二进制的单个 HTML 文件。
 
 ## Agent 自我进化
 
@@ -168,7 +176,7 @@ cargo test --release
 
 本仓库只做 release 构建（debug 中间产物曾把 `target/` 撑到 16 GB；约定固化在
 `.cargo/config.toml` 与 [CLAUDE.md](CLAUDE.md)）。代码结构：每个采集器一个
-`src/<tool>.rs`，`store.rs` 负责 Parquet + DuckDB + Rust 聚合，`context.rs`
+`src/<tool>.rs`，`store.rs` 负责 Parquet 读写与聚合，`context.rs`
 是搜索索引，`main.rs` 是 HTTP 层，`src/dashboard.html` 是整个 UI、编译期内嵌。
 
 ## Roadmap

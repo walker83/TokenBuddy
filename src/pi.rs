@@ -180,15 +180,14 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
 /// Conversational text for context search. Message entries carry
 /// `{role, content, timestamp}`; content is either a string or an array of
 /// typed parts whose `text` members hold the words.
-pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
+pub fn drain_messages(sink: &mut dyn FnMut(crate::context::ContextMessage)) {
     use crate::context::ContextMessage;
 
     let sessions_dir = get_pi_dir().join("agent").join("sessions");
     if !sessions_dir.exists() {
-        return vec![];
+        return;
     }
 
-    let mut msgs = Vec::new();
     for file_path in collect_session_files(&sessions_dir) {
         let file = match fs::File::open(&file_path) {
             Ok(f) => f,
@@ -241,7 +240,7 @@ pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
                 _ => String::new(),
             };
             if !text.trim().is_empty() {
-                msgs.push(ContextMessage {
+                sink(ContextMessage {
                     source: Source::Pi,
                     session_id: session_id.clone(),
                     role,
@@ -253,7 +252,6 @@ pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
             }
         }
     }
-    msgs
 }
 
 // ============================================================
@@ -263,65 +261,11 @@ pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
 // no input fallback here by design.
 // ============================================================
 
-pub fn collect_tool_events() -> Vec<crate::tools::ToolEvent> {
-    let sessions_dir = get_pi_dir().join("agent").join("sessions");
-    if !sessions_dir.exists() {
-        return vec![];
-    }
-    let mut evs = Vec::new();
-    for file_path in collect_session_files(&sessions_dir) {
-        let file = match fs::File::open(&file_path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let mut session_id = String::new();
-        for line_result in BufReader::new(file).lines() {
-            let Ok(line) = line_result else { continue };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-            if session_id.is_empty() && value.get("type").and_then(|t| t.as_str()) == Some("session") {
-                session_id = value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            }
-            if value.get("type").and_then(|t| t.as_str()) != Some("message") {
-                continue;
-            }
-            let Some(message) = value.get("message") else { continue };
-            if message.get("role").and_then(|r| r.as_str()) != Some("toolResult") {
-                continue;
-            }
-            let Some(call_id) = message.get("toolCallId").and_then(|v| v.as_str()) else { continue };
-            let timestamp = message
-                .get("timestamp")
-                .and_then(|ts| ts.as_i64())
-                .map(|ms| ms / 1000)
-                .or_else(|| file_mtime(&file_path))
-                .unwrap_or(0);
-            let text = match message.get("content") {
-                Some(serde_json::Value::String(s)) => s.clone(),
-                Some(serde_json::Value::Array(parts)) => parts
-                    .iter()
-                    .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                _ => String::new(),
-            };
-            if text.trim().is_empty() {
-                continue;
-            }
-            evs.push(crate::tools::ToolEvent {
-                source: Source::Pi,
-                session_id: session_id.clone(),
-                timestamp,
-                tool_name: message
-                    .get("toolName")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                block_key: call_id.to_string(),
-                text,
-                is_error: message.get("isError").and_then(|v| v.as_bool()).unwrap_or(false),
-            });
-        }
-    }
-    evs
+
+/// Collect into a vector; the sync path uses [`drain_messages`] so a source's
+/// messages are absorbed one at a time instead of all living at once.
+pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
+    let mut msgs = Vec::new();
+    drain_messages(&mut |m| msgs.push(m));
+    msgs
 }

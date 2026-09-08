@@ -7,8 +7,10 @@
 //! cached repeats.
 //!
 //! Pipeline: collectors → normalize+hash dedupe → `~/.tokenbuddy/context.parquet` →
-//! in-memory gram index (ASCII tokens in a BTreeMap so queries can match by
-//! prefix, CJK character bigrams in a HashMap). Queries first decide which
+//! a compact in-memory gram index (ASCII tokens in a BTreeMap so queries can
+//! match by prefix, CJK character bigrams in a HashMap; text lives compressed
+//! in a zstd arena and decompresses per candidate, so the index holds no
+//! per-doc String). Queries first decide which
 //! terms carry information: a term covering more than 30% of the corpus is a
 //! stopword by evidence, not by list. Candidates pool in three cascading
 //! tiers — AND over the rarest content terms, bigram AND, idf-weighted OR —
@@ -27,15 +29,13 @@ use anyhow::Result;
 use arrow::array::{
     Array, BooleanArray, BooleanBuilder, Int64Array, Int64Builder, RecordBatch, StringBuilder,
 };
-use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 /// Per-doc text kept in RAM and searched. Conversational messages rarely
@@ -169,20 +169,6 @@ pub struct SyncStats {
     pub imported: u64,
     pub skipped: u64,
     pub total_docs: u64,
-    // Tool-store stats (R1). Reported alongside so the dashboard and the
-    // R1 acceptance numbers come from one sync; see `tools::ToolSyncStats`.
-    #[serde(default)]
-    pub tool_collected: u64,
-    #[serde(default)]
-    pub tool_imported: u64,
-    /// Re-collection of already-stored blocks — idempotency, not noise.
-    #[serde(default)]
-    pub tool_id_dup_skipped: u64,
-    /// Same output under a different call id — the repeated-cache noise.
-    #[serde(default)]
-    pub tool_content_dup_skipped: u64,
-    #[serde(default)]
-    pub tool_total: u64,
 }
 
 // ============================================================
@@ -233,31 +219,15 @@ pub fn doc_id_of(source: &str, session_id: &str, normalized: &str) -> i64 {
 // Collection
 // ============================================================
 
-/// Pull conversational messages from every source. Errors in one source don't
-/// kill the rest — a rotated log is not a reason to drop the others.
-pub fn collect_all_messages() -> Vec<ContextMessage> {
-    let mut msgs = Vec::new();
-    msgs.extend(claude::collect_messages());
-    msgs.extend(zcode_opencode_mimo_messages());
-    msgs.extend(pi::collect_messages());
-    msgs.extend(qoder::collect_messages());
-    msgs.extend(workbuddy::collect_messages());
-    msgs
-}
-
 /// zcode / opencode / mimo share the opencode lineage schema: `message` rows
 /// carry role + visibility in a JSON `data` column, `part` rows carry the
 /// text under `type: "text"`. Hidden messages (background notifications) are
-/// filtered when the field is present.
-fn zcode_opencode_mimo_messages() -> Vec<ContextMessage> {
-    let mut msgs = Vec::new();
-    for (source, db_path) in [
-        (Source::Zcode, zcode::db_path()),
-        (Source::OpenCode, opencode::db_path()),
-        (Source::Mimo, mimo::db_path()),
-    ] {
+/// filtered when the field is present. One call per source so the sync can
+/// absorb and drop each source's messages instead of holding all of them.
+fn drain_lineage(source: Source, db_path: &std::path::Path, sink: &mut dyn FnMut(ContextMessage)) {
+    {
         if !db_path.exists() {
-            continue;
+            return;
         }
         let ok = (|| -> Result<()> {
             // Read-write open like the token collectors: a read-only open
@@ -298,7 +268,7 @@ fn zcode_opencode_mimo_messages() -> Vec<ContextMessage> {
                     Some("assistant") => "assistant",
                     _ => continue,
                 };
-                msgs.push(ContextMessage {
+                sink(ContextMessage {
                     source,
                     session_id,
                     role,
@@ -314,7 +284,6 @@ fn zcode_opencode_mimo_messages() -> Vec<ContextMessage> {
             eprintln!("[TokenBuddy] context: {} extraction failed: {e}", source.as_str());
         }
     }
-    msgs
 }
 
 // ============================================================
@@ -404,7 +373,7 @@ fn read_existing_doc_ids(path: &Path) -> Result<HashSet<i64>> {
 fn write_context_parquet(path: &Path, batch: &RecordBatch) -> Result<()> {
     let tmp = path.with_extension("parquet.tmp");
     let file = std::fs::File::create(&tmp)?;
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)?;
+    let mut writer = parquet::arrow::arrow_writer::ArrowWriter::try_new(file, batch.schema(), None)?;
     writer.write(batch)?;
     writer.close()?;
     std::fs::rename(tmp, path)?;
@@ -430,65 +399,102 @@ fn parquet_is_current_schema(path: &Path) -> bool {
 
 /// Collect from every source, dedupe against `path`, and append the new docs.
 /// `clear` rebuilds from scratch (the caller owns snapshotting, mirroring
-/// `sync_full`'s contract).
+/// Incremental collect+dedupe over the live sources, one source at a time:
+/// each source's message vector is absorbed and dropped before the next
+/// collector runs, so the transient peak is the largest single source, not
+/// every source's logs at once.
 pub fn sync_context(path: &Path, clear: bool) -> Result<SyncStats> {
-    sync_messages(path, clear, collect_all_messages())
+    let mut sink = SyncSink::open(path, clear)?;
+    {
+        let mut push = |m: ContextMessage| sink.absorb_one(m);
+        claude::drain_messages(&mut push);
+        drain_lineage(Source::Zcode, &zcode::db_path(), &mut push);
+        drain_lineage(Source::OpenCode, &opencode::db_path(), &mut push);
+        drain_lineage(Source::Mimo, &mimo::db_path(), &mut push);
+        pi::drain_messages(&mut push);
+        qoder::drain_messages(&mut push);
+        workbuddy::drain_messages(&mut push);
+    }
+    sink.finish(path)
+}
+
+/// Dedupe + writeback state shared by the streaming sync and the testable
+/// [`sync_messages`] core.
+struct SyncSink {
+    existing: std::collections::HashSet<i64>,
+    new_docs: Vec<(i64, ContextMessage, bool)>,
+    collected: u64,
+}
+
+impl SyncSink {
+    fn open(path: &Path, clear: bool) -> Result<Self> {
+        if path.exists() && (clear || !parquet_is_current_schema(path)) {
+            if !clear {
+                eprintln!("[TokenBuddy] context: legacy parquet schema, rebuilding");
+            }
+            let _ = std::fs::remove_file(path);
+        }
+        Ok(Self {
+            existing: read_existing_doc_ids(path)?,
+            new_docs: Vec::new(),
+            collected: 0,
+        })
+    }
+
+    fn absorb(&mut self, messages: Vec<ContextMessage>) {
+        for m in messages {
+            self.absorb_one(m);
+        }
+    }
+
+    fn absorb_one(&mut self, m: ContextMessage) {
+        self.collected += 1;
+        let (text, truncated) = truncate_chars(&m.text, MAX_DOC_CHARS);
+        let id = doc_id_of(m.source.as_str(), &m.session_id, &normalize(&text));
+        if !self.existing.insert(id) {
+            return;
+        }
+        self.new_docs.push((id, ContextMessage { text, ..m }, truncated));
+    }
+
+    fn finish(self, path: &Path) -> Result<SyncStats> {
+        let imported = self.new_docs.len() as u64;
+        if !self.new_docs.is_empty() {
+            // Stream old rows into the rewritten file one batch at a time —
+            // a read-everything-then-concat merge held two copies of the
+            // corpus in RAM and set the process's peak.
+            let new_batch = docs_to_batch(&self.new_docs);
+            let tmp = path.with_extension("parquet.tmp");
+            let out = std::fs::File::create(&tmp)?;
+            let mut writer =
+                parquet::arrow::arrow_writer::ArrowWriter::try_new(out, new_batch.schema(), None)?;
+            if path.exists() {
+                let file = std::fs::File::open(path)?;
+                let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+                for batch in reader {
+                    writer.write(&batch?)?;
+                }
+            }
+            writer.write(&new_batch)?;
+            writer.close()?;
+            std::fs::rename(tmp, path)?;
+        }
+
+        Ok(SyncStats {
+            collected: self.collected,
+            imported,
+            skipped: self.collected - imported,
+            total_docs: self.existing.len() as u64,
+        })
+    }
 }
 
 /// The testable core of [`sync_context`]: same contract, caller-supplied
 /// messages.
 pub fn sync_messages(path: &Path, clear: bool, messages: Vec<ContextMessage>) -> Result<SyncStats> {
-    if path.exists() && (clear || !parquet_is_current_schema(path)) {
-        if !clear {
-            eprintln!("[TokenBuddy] context: legacy parquet schema, rebuilding");
-        }
-        let _ = std::fs::remove_file(path);
-    }
-    let mut existing = read_existing_doc_ids(path)?;
-
-    let mut new_docs: Vec<(i64, ContextMessage, bool)> = Vec::new();
-    let mut collected = 0u64;
-    for m in messages {
-        collected += 1;
-        let (text, truncated) = truncate_chars(&m.text, MAX_DOC_CHARS);
-        let id = doc_id_of(m.source.as_str(), &m.session_id, &normalize(&text));
-        if !existing.insert(id) {
-            continue;
-        }
-        new_docs.push((id, ContextMessage { text, ..m }, truncated));
-    }
-    let imported = new_docs.len() as u64;
-
-    if !new_docs.is_empty() {
-        let new_batch = docs_to_batch(&new_docs);
-        let schema = context_schema();
-        let merged = if path.exists() && !clear {
-            let file = std::fs::File::open(path)?;
-            let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-            let batches: Vec<RecordBatch> = reader
-                .into_iter()
-                .map(|b| -> Result<RecordBatch> { Ok(b?) })
-                .collect::<Result<Vec<_>>>()?;
-            if batches.is_empty() {
-                new_batch
-            } else {
-                let mut all = batches;
-                all.push(new_batch);
-                concat_batches(&schema, &all)?
-            }
-        } else {
-            new_batch
-        };
-        write_context_parquet(path, &merged)?;
-    }
-
-    Ok(SyncStats {
-        collected,
-        imported,
-        skipped: collected - imported,
-        total_docs: existing.len() as u64,
-        ..Default::default()
-    })
+    let mut sink = SyncSink::open(path, clear)?;
+    sink.absorb(messages);
+    sink.finish(path)
 }
 
 fn truncate_chars(s: &str, max: usize) -> (String, bool) {
@@ -506,7 +512,6 @@ fn truncate_chars(s: &str, max: usize) -> (String, bool) {
 pub struct IndexStats {
     pub docs: usize,
     pub ascii_terms: usize,
-    pub cjk_words: usize,
     pub cjk_grams: usize,
     pub approx_bytes: usize,
     pub built_at: i64,
@@ -520,28 +525,84 @@ pub struct IndexStats {
     pub truncated_build: bool,
 }
 
+/// Role bytes stored per doc; the string forms live in `ROLE_NAMES`.
+const ROLE_USER: u8 = 0;
+const ROLE_ASSISTANT: u8 = 1;
+const ROLE_DIGEST: u8 = 2;
+const ROLE_NAMES: [&str; 3] = ["user", "assistant", "session_digest"];
+
+/// 32 bytes, all inline — the pre-interning `DocMeta` carried three `String`s
+/// per doc and the strings, not the metadata, were what set the index's
+/// floor. Sources, sessions and projects are interned; text lives compressed
+/// in `text_arena`.
 struct DocMeta {
     doc_id: i64,
-    source: String,
-    session_id: String,
-    role: &'static str,
     timestamp: i64,
-    len_chars: usize,
-    /// Raw project value (path or munged name, possibly empty); labels are
-    /// computed at the API boundary via `project_label`.
-    project: String,
+    session: u32,
+    len_chars: u32,
+    /// Index into `projects`.
+    project: u32,
+    source: u8,
+    role: u8,
     truncated: bool,
-    /// Tool docs only: the call's output is an error → boosted on
-    /// error-flavored queries. Conversation docs are always false.
-    is_error: bool,
+}
+
+/// One posting list inside `postings`: byte range of its delta-varint
+/// encoding, with the entry count (the document frequency) kept separately —
+/// varints are variable width, so decoding stops at `len` entries.
+#[derive(Clone, Copy)]
+struct Span {
+    off: u32,
+    len: u32,
+}
+
+/// Doc indices are ascending per term, so each posting encodes as the gap to
+/// its predecessor — one byte for the small gaps that dominate — keeping the
+/// whole posting arena a fraction of its u32 size.
+fn encode_deltas(postings: &[u32], out: &mut Vec<u8>) {
+    let mut prev = 0u32;
+    for &d in postings {
+        let mut gap = d.wrapping_sub(prev);
+        prev = d;
+        loop {
+            let b = (gap & 0x7f) as u8;
+            gap >>= 7;
+            if gap == 0 {
+                out.push(b);
+                break;
+            }
+            out.push(b | 0x80);
+        }
+    }
+}
+
+/// Inverse of [`encode_deltas`]; repeated doc indices (ascii tokens that
+/// occur twice in one doc) encode as zero-gap and decode back unchanged.
+fn decode_deltas(bytes: &[u8], entries: u32) -> Vec<u32> {
+    let mut out = Vec::with_capacity(entries as usize);
+    let (mut prev, mut i) = (0u32, 0usize);
+    while i < bytes.len() && out.len() < entries as usize {
+        let (mut gap, mut shift) = (0u32, 0u32);
+        loop {
+            let Some(b) = bytes.get(i) else { return out };
+            i += 1;
+            gap |= ((b & 0x7f) as u32) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        prev = prev.wrapping_add(gap);
+        out.push(prev);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TermKind {
     Ascii,
-    /// jieba word — the CJK precision tier.
-    Word,
-    /// CJK character bigram — the CJK recall tier.
+    /// CJK character bigram — the CJK tier. A lone CJK char that can form
+    /// no bigram arrives as a df-0 Gram so the pool falls to a full scan.
     Gram,
 }
 
@@ -561,33 +622,34 @@ struct QueryTerm {
 }
 
 /// Immutable, shareable search index over the context parquet.
+///
+/// Memory layout: one zstd-compressed text arena, one flat `Vec<u32>`
+/// posting arena sliced by `Span`s, and interned doc metadata — the whole
+/// index holds no per-doc `String` at all. A full index over the real corpus
+/// sits well under 100 MB resident; the arenas are what verification and
+/// snippet extraction decompress from, one doc at a time.
 pub struct ContextIndex {
     docs: Vec<DocMeta>,
-    /// Original-case text, for snippets.
-    texts: Vec<String>,
-    /// Lowercased copy of `texts`, built once per index so verification
-    /// never re-lowercases (up to) `MAX_VERIFY_CANDIDATES` docs per query.
-    lows: Vec<String>,
-    /// Lowercased ASCII-ish tokens → ascending doc indices.
-    ascii: BTreeMap<String, Vec<u32>>,
-    /// jieba CJK words → ascending doc indices (precision tier).
-    words: HashMap<String, Vec<u32>>,
-    /// CJK character bigrams → ascending doc indices (recall tier).
-    cjk: HashMap<String, Vec<u32>>,
-    /// (source, session_id) → display name: the tool's own title when it
+    /// Per-doc zstd frames concatenated; `text_spans[i]` is doc i's range.
+    text_arena: Vec<u8>,
+    text_spans: Vec<Span>,
+    /// All posting lists concatenated as delta-varints, ascending within
+    /// each span.
+    postings: Vec<u8>,
+    /// Lowercased ASCII-ish tokens → posting span.
+    ascii: BTreeMap<Box<str>, Span>,
+    /// CJK character bigrams → posting span.
+    cjk: HashMap<Box<str>, Span>,
+    /// (source id, session id) → display name: the tool's own title when it
     /// stores one, else the first user message.
-    titles: HashMap<(String, String), String>,
+    titles: HashMap<(u8, u32), Box<str>>,
     /// Every vocab entry's df, ascending — the relative stopword guard reads
     /// the whole distribution, not just one term's df.
-    df_hist: Vec<usize>,
-    /// Tool docs only: doc index → first 80 chars of the normalized indexed
-    /// text, so verbatim-prefix checks don't fight whitespace in the verify
-    /// loop (raw `lower` keeps newlines; queries don't).
-    tool_prefixes: HashMap<u32, String>,
-    /// R5.5 (O23): tool doc_id → equivalence prefix. Two hits sharing a
-    /// prefix are the same output seen in different sessions/turns; the
-    /// result list keeps one representative and counts the rest.
-    equiv_by_doc: HashMap<i64, String>,
+    df_hist: Vec<u32>,
+    /// Interning tables: ids in `DocMeta` index into these.
+    source_names: Vec<Box<str>>,
+    sessions: Vec<Box<str>>,
+    projects: Vec<Box<str>>,
     stats: IndexStats,
 }
 
@@ -605,26 +667,16 @@ fn is_token_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
 
-/// jieba is initialized lazily on the first index build; loading the built-in
-/// dictionary costs a few hundred milliseconds and must not sit on the server
-/// startup path.
-static JIEBA: OnceLock<jieba_rs::Jieba> = OnceLock::new();
-
-fn jieba() -> &'static jieba_rs::Jieba {
-    JIEBA.get_or_init(jieba_rs::Jieba::new)
-}
-
-/// Split text into indexable grams, in three tiers:
+/// Split text into indexable grams, in two tiers:
 /// - ASCII runs become whole lowercase tokens (`read_existing_doc_ids` stays
 ///   one token, split on `_` only in queries the same way);
-/// - CJK runs are cut into words with jieba — the precision tier;
-/// - every CJK run also contributes overlapping character bigrams — the
-///   recall tier, so fragments spanning word boundaries ("文搜" inside
-///   "上下文搜索") still find their docs.
+/// - CJK runs contribute overlapping character bigrams — "文搜" inside
+///   "上下文搜索" finds its docs, word boundaries and jieba's 55 MB
+///   dictionary alike. Substring verification at query time is the
+///   precision layer, so nothing needs a word tier.
 /// Everything else is a separator; query and target split identically.
-pub fn grams_of(text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+pub fn grams_of(text: &str) -> (Vec<String>, Vec<String>) {
     let mut tokens = Vec::new();
-    let mut words = Vec::new();
     let mut bigrams = Vec::new();
     let lower = text.to_lowercase();
     let mut word = String::new();
@@ -635,16 +687,9 @@ pub fn grams_of(text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
             tokens.push(std::mem::take(word));
         }
     }
-    fn flush_cjk(run: &mut String, words: &mut Vec<String>, bigrams: &mut Vec<String>) {
+    fn flush_cjk(run: &mut String, bigrams: &mut Vec<String>) {
         if run.is_empty() {
             return;
-        }
-        // Accurate-mode jieba cut; a lone character stays its own word so
-        // one-character queries keep a precision tier of their own.
-        for w in jieba().cut(run, false) {
-            if !w.trim().is_empty() {
-                words.push(w.to_lowercase());
-            }
         }
         let chars: Vec<char> = run.chars().collect();
         for w in chars.windows(2) {
@@ -655,19 +700,19 @@ pub fn grams_of(text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
 
     for ch in lower.chars() {
         if is_token_char(ch) {
-            flush_cjk(&mut cjk_run, &mut words, &mut bigrams);
+            flush_cjk(&mut cjk_run, &mut bigrams);
             word.push(ch);
         } else if is_cjk(ch) {
             flush_word(&mut word, &mut tokens);
             cjk_run.push(ch);
         } else {
             flush_word(&mut word, &mut tokens);
-            flush_cjk(&mut cjk_run, &mut words, &mut bigrams);
+            flush_cjk(&mut cjk_run, &mut bigrams);
         }
     }
     flush_word(&mut word, &mut tokens);
-    flush_cjk(&mut cjk_run, &mut words, &mut bigrams);
-    (tokens, words, bigrams)
+    flush_cjk(&mut cjk_run, &mut bigrams);
+    (tokens, bigrams)
 }
 
 /// Intersection of two ascending, deduped posting lists.
@@ -692,10 +737,9 @@ fn and_merge(a: &[u32], b: &[u32]) -> Vec<u32> {
 /// normalized text. Two hits where one's shingles are mostly contained in
 /// the other's read as "the agent restating the human" — kept once.
 fn shingles_of(text: &str) -> HashSet<u64> {
-    let (tokens, words, bigrams) = grams_of(&normalize(text));
+    let (tokens, bigrams) = grams_of(&normalize(text));
     tokens
         .into_iter()
-        .chain(words)
         .chain(bigrams)
         .map(|s| fnv1a(s.as_bytes()) as u64)
         .collect()
@@ -710,24 +754,274 @@ const DUPLICATE_CONTAINMENT: f64 = 0.55;
 /// not a restatement.
 const MIN_SHINGLES_FOR_DUP: usize = 12;
 
+/// zstd level for per-doc text frames in the arena. Level 3 measured a 1.6×
+/// ratio on the real corpus (code-heavy conversation text compresses poorly);
+/// higher levels bought almost nothing for the extra build seconds.
+const TEXT_ZSTD_LEVEL: i32 = 3;
+/// Scratch state for one index build, in two streaming passes over the
+/// parquet: pass 1 sizes every term's posting list, pass 2 fills a single
+/// pre-sized u32 bucket arena (one large allocation the OS takes back when
+/// the build ends) and compresses doc text into its arena. Raw text and
+/// per-term `Vec`s never both live in RAM at scale.
+struct IndexBuilder {
+    docs: Vec<DocMeta>,
+    text_arena: Vec<u8>,
+    text_spans: Vec<Span>,
+    /// term string → term id, shared by both passes.
+    terms: HashMap<Box<str>, u32>,
+    /// per term: posting-list length (pass 1) then arena offset (finalize).
+    counts: Vec<u32>,
+    /// Ascii-kind terms by id, so finalize can build the ordered BTreeMap
+    /// without re-tokenizing.
+    ascii_ids: HashSet<u32>,
+    source_ids: HashMap<Box<str>, u8>,
+    source_names: Vec<Box<str>>,
+    session_ids: HashMap<Box<str>, u32>,
+    sessions: Vec<Box<str>>,
+    project_ids: HashMap<Box<str>, u32>,
+    projects: Vec<Box<str>>,
+    titles: HashMap<(u8, u32), Box<str>>,
+    /// First user message per session — digest text and the title fallback.
+    first_user: HashMap<(u8, u32), Box<str>>,
+}
+
+impl IndexBuilder {
+    fn new() -> Self {
+        Self {
+            docs: Vec::new(),
+            text_arena: Vec::new(),
+            text_spans: Vec::new(),
+            terms: HashMap::new(),
+            counts: Vec::new(),
+            ascii_ids: HashSet::new(),
+            source_ids: HashMap::new(),
+            source_names: Vec::new(),
+            session_ids: HashMap::new(),
+            sessions: Vec::new(),
+            project_ids: HashMap::new(),
+            projects: Vec::new(),
+            titles: HashMap::new(),
+            first_user: HashMap::new(),
+        }
+    }
+
+    fn intern_source(&mut self, s: &str) -> u8 {
+        if let Some(&id) = self.source_ids.get(s) {
+            return id;
+        }
+        let id = self.source_names.len() as u8;
+        self.source_names.push(s.into());
+        self.source_ids.insert(s.into(), id);
+        id
+    }
+
+    fn intern_session(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.session_ids.get(s) {
+            return id;
+        }
+        let id = self.sessions.len() as u32;
+        self.sessions.push(s.into());
+        self.session_ids.insert(s.into(), id);
+        id
+    }
+
+    fn intern_project(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.project_ids.get(s) {
+            return id;
+        }
+        let id = self.projects.len() as u32;
+        self.projects.push(s.into());
+        self.project_ids.insert(s.into(), id);
+        id
+    }
+
+    /// Pass 1: size the posting lists. Tokenization mirrors `count_doc` —
+    /// ascii tokens count per occurrence, CJK bigrams dedupe per doc — so the
+    /// pass-2 cursor writes never overrun.
+    fn count_doc(&mut self, text: &str) {
+        let (tokens, bigrams) = grams_of(text);
+        let tid = |b: &mut Self, t: Box<str>| -> u32 {
+            let n = b.terms.len() as u32;
+            let id = *b.terms.entry(t).or_insert(n);
+            if id == n {
+                b.counts.push(0);
+            }
+            id
+        };
+        for t in tokens {
+            let id = tid(self, t.into_boxed_str());
+            self.ascii_ids.insert(id);
+            self.counts[id as usize] += 1;
+        }
+        let mut seen_grams = HashSet::new();
+        for g in bigrams {
+            if seen_grams.insert(g.clone()) {
+                let id = tid(self, g.into_boxed_str());
+                self.counts[id as usize] += 1;
+            }
+        }
+    }
+
+    /// Pass 2: append one doc — posting writes into the bucket arena slices
+    /// handed in by the caller (`cursors` advance per term), original-case
+    /// text compressed into its arena. `idx` must equal the doc's final
+    /// position, i.e. docs arrive in the same order pass 1 saw them.
+    fn push_doc(
+        &mut self,
+        doc_id: i64,
+        timestamp: i64,
+        source: u8,
+        session: u32,
+        project: u32,
+        role: u8,
+        truncated: bool,
+        text: &str,
+        buckets: &mut [u32],
+        cursors: &mut [u32],
+    ) {
+        let idx = self.docs.len() as u32;
+        let (tokens, bigrams) = grams_of(text);
+        let write = |tid: u32, buckets: &mut [u32], cursors: &mut [u32]| {
+            let c = &mut cursors[tid as usize];
+            let slot = *c;
+            *c += 1;
+            buckets[slot as usize] = idx;
+        };
+        for t in tokens {
+            let id = self.terms[t.as_str()];
+            write(id, buckets, cursors);
+        }
+        let mut seen_grams = HashSet::new();
+        for g in bigrams {
+            if seen_grams.insert(g.clone()) {
+                let id = self.terms[g.as_str()];
+                write(id, buckets, cursors);
+            }
+        }
+        let compressed = zstd::bulk::compress(text.as_bytes(), TEXT_ZSTD_LEVEL)
+            .unwrap_or_else(|_| text.as_bytes().to_vec());
+        let span = Span {
+            off: self.text_arena.len() as u32,
+            len: compressed.len() as u32,
+        };
+        self.text_arena.extend_from_slice(&compressed);
+        self.text_spans.push(span);
+        self.docs.push(DocMeta {
+            doc_id,
+            timestamp,
+            session,
+            len_chars: text.chars().count() as u32,
+            project,
+            source,
+            role,
+            truncated,
+        });
+    }
+
+    /// Finalize into the compact `ContextIndex`: each term's bucket interval
+    /// sorts ascending, delta-varint-encodes into the posting arena, and
+    /// records its `Span`; the bucket arena drops on return.
+    fn finish(
+        self,
+        mut buckets: Vec<u32>,
+        offsets: Vec<u32>,
+        build_ms: u64,
+        truncated_build: bool,
+        oldest: Option<i64>,
+        newest: Option<i64>,
+        by_source: HashMap<String, usize>,
+        by_project: HashMap<String, usize>,
+    ) -> ContextIndex {
+        let n_terms = self.counts.len();
+        let mut postings: Vec<u8> = Vec::new();
+        let mut ascii: BTreeMap<Box<str>, Span> = BTreeMap::new();
+        let mut cjk: HashMap<Box<str>, Span> = HashMap::with_capacity(n_terms - self.ascii_ids.len());
+        for (term, &tid) in &self.terms {
+            let (off, len) = (offsets[tid as usize] as usize, self.counts[tid as usize] as usize);
+            let interval = &mut buckets[off..off + len];
+            interval.sort_unstable();
+            let span = Span { off: postings.len() as u32, len: len as u32 };
+            encode_deltas(interval, &mut postings);
+            if self.ascii_ids.contains(&tid) {
+                ascii.insert(term.clone(), span);
+            } else {
+                cjk.insert(term.clone(), span);
+            }
+        }
+
+        let mut df_hist: Vec<u32> = ascii
+            .values()
+            .chain(cjk.values())
+            .map(|s| s.len)
+            .collect();
+        df_hist.sort_unstable();
+
+        // Live-bytes estimate of everything the index holds at rest.
+        let ascii_key_bytes: usize = ascii.keys().map(|k| k.len()).sum();
+        let cjk_key_bytes: usize = cjk.keys().map(|k| k.len()).sum();
+        let approx_bytes = postings.len()
+            + self.text_arena.len()
+            + self.text_spans.len() * std::mem::size_of::<Span>()
+            + (ascii.len() + cjk.len()) * (std::mem::size_of::<Span>() + 3 * std::mem::size_of::<usize>())
+            + ascii_key_bytes
+            + cjk_key_bytes
+            + self.docs.len() * std::mem::size_of::<DocMeta>()
+            + df_hist.len() * 4
+            + self.sessions.iter().map(|s| s.len()).sum::<usize>()
+            + self.projects.iter().map(|s| s.len()).sum::<usize>();
+
+        let stats = IndexStats {
+            docs: self.docs.len(),
+            ascii_terms: ascii.len(),
+            cjk_grams: cjk.len(),
+            approx_bytes,
+            built_at: crate::now_ts(),
+            build_ms,
+            oldest,
+            newest,
+            by_source,
+            by_project,
+            truncated_build,
+        };
+
+        ContextIndex {
+            docs: self.docs,
+            text_arena: self.text_arena,
+            text_spans: self.text_spans,
+            postings,
+            ascii,
+            cjk,
+            titles: self.titles,
+            df_hist,
+            source_names: self.source_names,
+            sessions: self.sessions,
+            projects: self.projects,
+            stats,
+        }
+    }
+}
+
 impl ContextIndex {
     /// Build from the context parquet. Missing file → an empty, usable index.
+    /// Two streaming passes: pass 1 sizes every posting list (and derives the
+    /// session digests, so their terms are sized too); pass 2 fills one
+    /// pre-sized bucket arena and compresses text — the index never holds
+    /// raw corpus text or per-term `Vec`s.
     pub fn build(path: &Path) -> Result<Self> {
         let t0 = Instant::now();
-        let mut docs = Vec::new();
-        let mut texts = Vec::new();
-        let mut lows = Vec::new();
-        let mut ascii: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-        let mut words: HashMap<String, Vec<u32>> = HashMap::new();
-        let mut cjk: HashMap<String, Vec<u32>> = HashMap::new();
-        let mut session_titles: HashMap<(String, String), String> = HashMap::new();
-        let mut session_project: HashMap<(String, String), String> = HashMap::new();
+        let mut b = IndexBuilder::new();
         let mut truncated_build = false;
+        // (doc count, max ts, has_user, first project id) per session.
+        let mut sess_stat: HashMap<(u8, u32), (usize, i64, bool, u32)> = HashMap::new();
+        // Rows pass 1 accepted — pass 2 must stop at the same row under the
+        // MAX_INDEX_DOCS cap.
+        let mut pass1_docs = 0usize;
 
         if path.exists() {
+            // ---- Pass 1: term sizes, session stats, digests, interning ----
             let file = std::fs::File::open(path)?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-            'batches: for batch in reader {
+            'p1: for batch in reader {
                 let batch = batch?;
                 let n = batch.num_rows();
                 let ids = int_col(&batch, "doc_id");
@@ -738,6 +1032,109 @@ impl ContextIndex {
                 let texts_col = string_col(&batch, "text");
                 let projects_col = string_col(&batch, "project");
                 let titles_col = string_col(&batch, "title");
+                let truncs = bool_col(&batch, "truncated");
+                let (
+                    Some(_ids),
+                    Some(sources),
+                    Some(sids),
+                    Some(roles),
+                    Some(tss),
+                    Some(texts_col),
+                    Some(_truncs),
+                ) = (ids, sources, sids, roles, tss, texts_col, truncs)
+                else {
+                    continue;
+                };
+                for i in 0..n {
+                    if pass1_docs >= MAX_INDEX_DOCS {
+                        truncated_build = true;
+                        break 'p1;
+                    }
+                    let (text, _) = truncate_chars(texts_col.value(i), MAX_DOC_CHARS);
+                    let source = b.intern_source(sources.value(i));
+                    let session = b.intern_session(sids.value(i));
+                    let project_id =
+                        b.intern_project(projects_col.map(|c| c.value(i)).unwrap_or(""));
+                    let role = if roles.value(i) == "user" { ROLE_USER } else { ROLE_ASSISTANT };
+                    let ts = tss.value(i);
+                    let title = titles_col.map(|c| c.value(i)).unwrap_or("");
+                    if !title.is_empty() {
+                        // Last non-empty title wins: tools rename sessions as
+                        // they go, and parquet order is roughly chronological.
+                        b.titles.insert(
+                            (source, session),
+                            truncate_chars(title, 80).0.into_boxed_str(),
+                        );
+                    }
+                    b.count_doc(&text);
+                    let key = (source, session);
+                    let e = sess_stat
+                        .entry(key)
+                        .or_insert((0usize, 0i64, role == ROLE_USER, project_id));
+                    e.0 += 1;
+                    if ts > e.1 {
+                        e.1 = ts;
+                    }
+                    if role == ROLE_USER && !b.first_user.contains_key(&key) {
+                        let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        b.first_user
+                            .insert(key, truncate_chars(&preview, 160).0.into_boxed_str());
+                    }
+                    pass1_docs += 1;
+                }
+            }
+        }
+
+        // Session digests: one deterministic summary doc per session with
+        // enough activity — indexed (so a session's own task words route to
+        // it) but popped out of ranked results at query time. Derived here so
+        // their terms are part of pass 1's sizing.
+        let digest_inputs: Vec<((u8, u32), usize, i64, u32)> = sess_stat
+            .iter()
+            .filter(|(_, &(count, _, has_user, _))| count >= 4 && has_user)
+            .map(|(&k, &(count, max_ts, _, project_id))| (k, count, max_ts, project_id))
+            .collect();
+        let mut digests: Vec<(i64, i64, u8, u32, u32, String)> = Vec::new();
+        for ((source, session), count, max_ts, project_id) in digest_inputs {
+            let Some(preview) = b.first_user.get(&(source, session)) else { continue };
+            let mut digest = String::from(preview.as_ref());
+            digest.push_str(&format!("\n消息: {count}"));
+            let doc_id = doc_id_of(
+                b.source_names[source as usize].as_ref(),
+                b.sessions[session as usize].as_ref(),
+                "session-digest",
+            );
+            b.count_doc(&digest);
+            digests.push((doc_id, max_ts, source, session, project_id, digest));
+        }
+
+        // ---- Bucket arena: one large allocation, one interval per term ----
+        let total: u32 = b.counts.iter().map(|&c| c as u64).sum::<u64>() as u32;
+        let mut offsets: Vec<u32> = Vec::with_capacity(b.counts.len() + 1);
+        let mut acc = 0u32;
+        for &c in &b.counts {
+            offsets.push(acc);
+            acc += c;
+        }
+        offsets.push(acc);
+        let mut buckets: Vec<u32> = vec![0u32; total as usize];
+        let mut cursors: Vec<u32> = offsets[..offsets.len() - 1].to_vec();
+
+        if path.exists() {
+            // ---- Pass 2: fill buckets, compress text ----
+            let file = std::fs::File::open(path)?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+            let mut seen = 0usize;
+            'p2: for batch in reader {
+                let batch = batch?;
+                let n = batch.num_rows();
+                let ids = int_col(&batch, "doc_id");
+                let sources = string_col(&batch, "source");
+                let sids = string_col(&batch, "session_id");
+                let roles = string_col(&batch, "role");
+                let tss = int_col(&batch, "timestamp");
+                let texts_col = string_col(&batch, "text");
+                let projects_col = string_col(&batch, "project");
                 let truncs = bool_col(&batch, "truncated");
                 let (
                     Some(ids),
@@ -752,281 +1149,61 @@ impl ContextIndex {
                     continue;
                 };
                 for i in 0..n {
-                    if docs.len() >= MAX_INDEX_DOCS {
-                        truncated_build = true;
-                        break 'batches;
+                    if seen >= pass1_docs {
+                        break 'p2;
                     }
+                    seen += 1;
                     let (text, _) = truncate_chars(texts_col.value(i), MAX_DOC_CHARS);
-                    let project = projects_col.map(|c| c.value(i).to_string()).unwrap_or_default();
-                    let title = titles_col.map(|c| c.value(i).to_string()).unwrap_or_default();
-                    if !project.is_empty() {
-                        // Tool docs join back to this map: the store carries no
-                        // project column, but a session always lives in one.
-                        session_project
-                            .entry((sources.value(i).to_string(), sids.value(i).to_string()))
-                            .or_insert_with(|| project.clone());
-                    }
-                    if !title.is_empty() {
-                        // Last non-empty title wins: tools rename sessions as
-                        // they go, and parquet order is roughly chronological.
-                        session_titles.insert(
-                            (sources.value(i).to_string(), sids.value(i).to_string()),
-                            truncate_chars(&title, 80).0,
-                        );
-                    }
-                    let idx = docs.len() as u32;
-                    let (tokens, cjk_words, bigrams) = grams_of(&text);
-                    for t in &tokens {
-                        ascii.entry(t.clone()).or_default().push(idx);
-                    }
-                    // windows(2) over one run cannot repeat a bigram, and one
-                    // jieba run yields each word once, but repeated runs in a
-                    // doc ("天天天天", the same word twice) can — dedupe so a
-                    // doc appears at most once per posting list entry scan.
-                    let mut seen_words = HashSet::new();
-                    for w in &cjk_words {
-                        if seen_words.insert(w.as_str()) {
-                            words.entry(w.clone()).or_default().push(idx);
-                        }
-                    }
-                    let mut seen_grams = HashSet::new();
-                    for g in &bigrams {
-                        if seen_grams.insert(g.as_str()) {
-                            cjk.entry(g.clone()).or_default().push(idx);
-                        }
-                    }
-                    docs.push(DocMeta {
-                        doc_id: ids.value(i),
-                        source: sources.value(i).to_string(),
-                        session_id: sids.value(i).to_string(),
-                        role: match roles.value(i) {
-                            "user" => "user",
-                            _ => "assistant",
-                        },
-                        timestamp: tss.value(i),
-                        len_chars: text.chars().count(),
-                        project,
-                        truncated: truncs.value(i),
-                        is_error: false,
-                    });
-                    lows.push(text.to_lowercase());
-                    texts.push(text);
+                    let source = b.source_ids[sources.value(i)];
+                    let session = b.session_ids[sids.value(i)];
+                    let project_id =
+                        b.project_ids[projects_col.map(|c| c.value(i)).unwrap_or("")];
+                    let role = if roles.value(i) == "user" { ROLE_USER } else { ROLE_ASSISTANT };
+                    b.push_doc(
+                        ids.value(i),
+                        tss.value(i),
+                        source,
+                        session,
+                        project_id,
+                        role,
+                        truncs.value(i),
+                        &text,
+                        &mut buckets,
+                        &mut cursors,
+                    );
                 }
             }
         }
-
-        // ---- Tool layer (R2): bounded synopses from the tools store ----
-        // One doc per stored call; text is the deterministic projection π, so
-        // index RAM is bounded by SYNOPSIS_MAX_CHARS × event count regardless
-        // of how large the raw outputs are.
-        let mut tool_prefixes: HashMap<u32, String> = HashMap::new();
-        let mut equiv_by_doc: HashMap<i64, String> = HashMap::new();
-        // R3 session aggregates for digest docs: tool names, file paths and
-        // error counts per (source, session), collected while streaming the
-        // tools store — no second pass over raw text.
-        let mut sess_tools: HashMap<(String, String), (HashSet<String>, HashMap<String, usize>, usize)> = HashMap::new();
-        let tools_path = path.with_file_name("tools.parquet");
-        if tools_path.exists() && docs.len() < MAX_INDEX_DOCS {
-            let tools_reader = std::fs::File::open(&tools_path)
-                .ok()
-                .and_then(|f| ParquetRecordBatchReaderBuilder::try_new(f).ok())
-                .map(|b| b.build());
-            match tools_reader {
-                Some(Ok(reader)) => {
-                    'tools: for batch in reader {
-                        let batch = match batch {
-                            Ok(b) => b,
-                            Err(_) => continue,
-                        };
-                        let n = batch.num_rows();
-                        let (Some(t_ids), Some(t_sources), Some(t_sids), Some(t_tools), Some(t_errs), Some(t_tss), Some(t_fps), Some(t_texts)) = (
-                            int_col(&batch, "doc_id"),
-                            string_col(&batch, "source"),
-                            string_col(&batch, "session_id"),
-                            string_col(&batch, "tool_name"),
-                            bool_col(&batch, "is_error"),
-                            int_col(&batch, "timestamp"),
-                            string_col(&batch, "file_paths"),
-                            string_col(&batch, "text"),
-                        ) else {
-                            continue;
-                        };
-                        for i in 0..n {
-                            if docs.len() >= MAX_INDEX_DOCS {
-                                truncated_build = true;
-                                break 'tools;
-                            }
-                            let syn = crate::tools::synopsis(t_texts.value(i));
-                            let fps = t_fps.value(i);
-                            // File paths are search signal in their own right —
-                            // appended so grams_of sees them as tokens.
-                            let indexed_text = if fps.is_empty() {
-                                syn
-                            } else {
-                                format!("{syn}\n{}", fps.replace('\u{1}', "\n"))
-                            };
-                            if !fps.is_empty() {
-                                let agg = sess_tools.entry((t_sources.value(i).to_string(), t_sids.value(i).to_string())).or_default();
-                                for p in fps.split('\u{1}').take(3) {
-                                    let c = agg.1.entry(p.to_string()).or_insert(0);
-                                    if *c < 5 {
-                                        *c += 1;
-                                    }
-                                }
-                            }
-                            if indexed_text.trim().is_empty() {
-                                continue;
-                            }
-                            let key = (t_sources.value(i).to_string(), t_sids.value(i).to_string());
-                            let idx = docs.len() as u32;
-                            let (tokens, cjk_words, bigrams) = grams_of(&indexed_text);
-                            for t in &tokens {
-                                ascii.entry(t.clone()).or_default().push(idx);
-                            }
-                            let mut seen_words = HashSet::new();
-                            for w in &cjk_words {
-                                if seen_words.insert(w.as_str()) {
-                                    words.entry(w.clone()).or_default().push(idx);
-                                }
-                            }
-                            let mut seen_grams = HashSet::new();
-                            for g in &bigrams {
-                                if seen_grams.insert(g.as_str()) {
-                                    cjk.entry(g.clone()).or_default().push(idx);
-                                }
-                            }
-                            docs.push(DocMeta {
-                                doc_id: t_ids.value(i),
-                                source: key.0.clone(),
-                                session_id: key.1.clone(),
-                                role: "tool",
-                                timestamp: t_tss.value(i),
-                                len_chars: indexed_text.chars().count(),
-                                project: session_project.get(&key).cloned().unwrap_or_default(),
-                                truncated: false,
-                                is_error: t_errs.value(i),
-                            });
-                            lows.push(indexed_text.to_lowercase());
-                            texts.push(indexed_text.clone());
-                            let equiv_prefix = normalize(&indexed_text).chars().take(80).collect::<String>();
-                            tool_prefixes.insert(idx, equiv_prefix.clone());
-                            equiv_by_doc.insert(t_ids.value(i), equiv_prefix);
-                            // session aggregates
-                            if !t_tools.value(i).is_empty() {
-                                let agg = sess_tools.entry(key.clone()).or_default();
-                                if agg.0.len() < 10 {
-                                    agg.0.insert(t_tools.value(i).to_string());
-                                }
-                                if t_errs.value(i) {
-                                    agg.2 += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-                other => {
-                    if let Some(Err(e)) = other {
-                        eprintln!("[TokenBuddy] context: tools parquet unreadable, index stays conversation-only: {e}");
-                    }
-                }
-            }
-        }
-
-        // ---- T2 session digests (R3): one deterministic summary doc per
-        // session with enough activity. They are INDEXED (so a session's own
-        // task words route to it) and used for score propagation, but popped
-        // out of the ranked results at query time into `session_headers` —
-        // headers, not results, so they never steal a slot from content.
-        let mut sess_stat: HashMap<(String, String), (usize, i64, bool)> = HashMap::new(); // conv+tool count, max ts, has_user
-        let mut sess_first_user: HashMap<(String, String), String> = HashMap::new();
-        for (i, d) in docs.iter().enumerate() {
-            if d.role == "session_digest" {
-                continue;
-            }
-            let key = (d.source.clone(), d.session_id.clone());
-            let e = sess_stat.entry(key.clone()).or_insert((0usize, 0i64, false));
-            e.0 += 1;
-            if d.timestamp > e.1 {
-                e.1 = d.timestamp;
-            }
-            if d.role == "user" {
-                e.2 = true;
-                if d.role == "user" {
-                    sess_first_user.entry(key).or_insert_with(|| {
-                        truncate_chars(&texts[i].split_whitespace().collect::<Vec<_>>().join(" "), 160).0
-                    });
-                }
-            }
-        }
-        for ((src, sid), (count, max_ts, has_user)) in &sess_stat {
-            if *count < 4 || !*has_user || docs.len() >= MAX_INDEX_DOCS {
-                continue;
-            }
-            let key = (src.clone(), sid.clone());
-            let mut digest = sess_first_user.get(&key).cloned().unwrap_or_default();
-            if let Some((tools, files, errors)) = sess_tools.get(&key) {
-                if !tools.is_empty() {
-                    let mut names: Vec<&String> = tools.iter().collect();
-                    names.sort();
-                    digest.push_str(&format!("\n工具: {}", names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
-                }
-                if !files.is_empty() {
-                    let mut fs: Vec<(usize, &String)> = files.iter().map(|(k, v)| (*v, k)).collect();
-                    fs.sort_by(|a, b| b.0.cmp(&a.0));
-                    digest.push_str(&format!("\n文件: {}", fs.into_iter().take(5).map(|(_, p)| p.as_str()).collect::<Vec<_>>().join(", ")));
-                }
-                if *errors > 0 {
-                    digest.push_str(&format!("\n报错: {errors} 次"));
-                }
-            }
-            digest.push_str(&format!("\n消息: {count}"));
-            if digest.trim().is_empty() {
-                continue;
-            }
-            let doc_id = doc_id_of(src, sid, "session-digest");
-            let idx = docs.len() as u32;
-            let (tokens, cjk_words, bigrams) = grams_of(&digest);
-            for t in &tokens {
-                ascii.entry(t.clone()).or_default().push(idx);
-            }
-            let mut seen_words = HashSet::new();
-            for w in &cjk_words {
-                if seen_words.insert(w.as_str()) {
-                    words.entry(w.clone()).or_default().push(idx);
-                }
-            }
-            let mut seen_grams = HashSet::new();
-            for g in &bigrams {
-                if seen_grams.insert(g.as_str()) {
-                    cjk.entry(g.clone()).or_default().push(idx);
-                }
-            }
-            docs.push(DocMeta {
+        for (doc_id, max_ts, source, session, project_id, digest) in digests {
+            b.push_doc(
                 doc_id,
-                source: src.clone(),
-                session_id: sid.clone(),
-                role: "session_digest",
-                timestamp: *max_ts,
-                len_chars: digest.chars().count(),
-                project: session_project.get(&key).cloned().unwrap_or_default(),
-                truncated: false,
-                is_error: false,
-            });
-            lows.push(digest.to_lowercase());
-            texts.push(digest);
+                max_ts,
+                source,
+                session,
+                project_id,
+                ROLE_DIGEST,
+                false,
+                &digest,
+                &mut buckets,
+                &mut cursors,
+            );
         }
 
         let mut by_source: HashMap<String, usize> = HashMap::new();
         let mut by_project: HashMap<String, usize> = HashMap::new();
         let mut oldest: Option<i64> = None;
         let mut newest: Option<i64> = None;
-        for d in &docs {
-            if d.role == "session_digest" {
+        for d in &b.docs {
+            if d.role == ROLE_DIGEST {
                 continue;
             }
-            *by_source.entry(d.source.clone()).or_default() += 1;
-            if !d.project.is_empty() {
-                *by_project.entry(project_label(&d.project)).or_default() += 1;
+            *by_source
+                .entry(b.source_names[d.source as usize].to_string())
+                .or_default() += 1;
+            if !b.projects[d.project as usize].is_empty() {
+                *by_project
+                    .entry(project_label(&b.projects[d.project as usize]))
+                    .or_default() += 1;
             }
             if d.timestamp > 0 {
                 oldest = Some(oldest.map_or(d.timestamp, |o| o.min(d.timestamp)));
@@ -1036,48 +1213,26 @@ impl ContextIndex {
 
         // Sessions no source titled get their first user message as the
         // display name — the same anchor a person would scan for.
-        for (i, d) in docs.iter().enumerate() {
-            let key = (d.source.clone(), d.session_id.clone());
-            if !session_titles.contains_key(&key) && d.role == "user" {
-                let preview = texts[i].split_whitespace().collect::<Vec<_>>().join(" ");
-                session_titles.insert(key, truncate_chars(&preview, 60).0);
-            }
+        let fallback_titles: Vec<((u8, u32), String)> = b
+            .first_user
+            .keys()
+            .filter(|k| !b.titles.contains_key(k))
+            .map(|k| (*k, truncate_chars(&b.first_user[k], 60).0))
+            .collect();
+        for (k, v) in fallback_titles {
+            b.titles.insert(k, v.into_boxed_str());
         }
 
-        let mut df_hist: Vec<usize> = ascii
-            .values()
-            .chain(words.values())
-            .chain(cjk.values())
-            .map(|p| p.len())
-            .collect();
-        df_hist.sort_unstable();
-
-        let approx_bytes = texts.iter().map(|t| t.len()).sum::<usize>()
-            + lows.iter().map(|t| t.len()).sum::<usize>()
-            + ascii.len() * 48
-            + ascii.values().map(|v| v.len() * 4).sum::<usize>()
-            + words.len() * 48
-            + words.values().map(|v| v.len() * 4).sum::<usize>()
-            + cjk.len() * 48
-            + cjk.values().map(|v| v.len() * 4).sum::<usize>()
-            + docs.len() * 96;
-
-        let stats = IndexStats {
-            docs: docs.len(),
-            ascii_terms: ascii.len(),
-            cjk_words: words.len(),
-            cjk_grams: cjk.len(),
-            approx_bytes,
-            built_at: crate::now_ts(),
-            build_ms: t0.elapsed().as_millis() as u64,
+        Ok(b.finish(
+            buckets,
+            offsets,
+            t0.elapsed().as_millis() as u64,
+            truncated_build,
             oldest,
             newest,
             by_source,
             by_project,
-            truncated_build,
-        };
-
-        Ok(Self { docs, texts, lows, ascii, words, cjk, titles: session_titles, df_hist, tool_prefixes, equiv_by_doc, stats })
+        ))
     }
 
     pub fn stats(&self) -> &IndexStats {
@@ -1086,9 +1241,30 @@ impl ContextIndex {
 
     fn session_title(&self, meta: &DocMeta) -> String {
         self.titles
-            .get(&(meta.source.clone(), meta.session_id.clone()))
-            .cloned()
+            .get(&(meta.source, meta.session))
+            .map(|s| s.to_string())
             .unwrap_or_default()
+    }
+
+    /// Decode one posting list from the delta-varint arena.
+    fn decode_postings(&self, span: Span) -> Vec<u32> {
+        decode_deltas(
+            &self.postings[span.off as usize..],
+            span.len,
+        )
+    }
+
+    /// Decompress one doc's original-case text from the arena. A zstd frame
+    /// per doc keeps this a single slice + call; if compression ever failed
+    /// at build time the span holds the raw bytes, so decompression errors
+    /// fall back to reading the span directly.
+    fn doc_text(&self, idx: usize) -> String {
+        let span = self.text_spans[idx];
+        let raw = &self.text_arena[span.off as usize..(span.off + span.len) as usize];
+        match zstd::bulk::decompress(raw, MAX_DOC_CHARS * 4) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(_) => String::from_utf8_lossy(raw).into_owned(),
+        }
     }
 
     /// One session's messages around an anchor doc — "take me back to that
@@ -1106,17 +1282,20 @@ impl ContextIndex {
     ) -> Option<SessionContext> {
         const VIEW_MSG_CHARS: usize = 1500;
         let around = around.clamp(1, 50);
+        // Interned ids make the filter integer comparisons.
+        let src_id = self.source_names.iter().position(|s| s.as_ref() == source)? as u8;
+        let sess_id = self.sessions.iter().position(|s| s.as_ref() == session_id)? as u32;
         let mut idxs: Vec<usize> = (0..self.docs.len())
             .filter(|&i| {
-                self.docs[i].source == source
-                    && self.docs[i].session_id == session_id
-                    && self.docs[i].role != "session_digest"
+                self.docs[i].source == src_id
+                    && self.docs[i].session == sess_id
+                    && self.docs[i].role != ROLE_DIGEST
             })
             .collect();
         if idxs.is_empty() {
             return None;
         }
-        idxs.sort_by_key(|&i| (self.docs[i].timestamp, self.docs[i].doc_id));
+        idxs.sort_unstable_by_key(|&i| (self.docs[i].timestamp, self.docs[i].doc_id));
         let anchor = idxs
             .iter()
             .position(|&i| self.docs[i].doc_id == anchor_doc_id)
@@ -1127,9 +1306,9 @@ impl ContextIndex {
             .iter()
             .map(|&i| {
                 let m = &self.docs[i];
-                let (text, _) = truncate_chars(&self.texts[i], VIEW_MSG_CHARS);
+                let (text, _) = truncate_chars(&self.doc_text(i), VIEW_MSG_CHARS);
                 SessionMessage {
-                    role: m.role,
+                    role: ROLE_NAMES[m.role as usize],
                     timestamp: m.timestamp,
                     text,
                     matched: m.doc_id == anchor_doc_id,
@@ -1139,7 +1318,7 @@ impl ContextIndex {
         Some(SessionContext {
             source: source.to_string(),
             session_id: session_id.to_string(),
-            project: project_label(&self.docs[idxs[anchor]].project),
+            project: project_label(&self.projects[self.docs[idxs[anchor]].project as usize]),
             title: self.session_title(&self.docs[idxs[anchor]]),
             total: idxs.len(),
             anchor_pos: anchor,
@@ -1162,7 +1341,7 @@ impl ContextIndex {
     /// drive the pool stages, verification and highlighting; the split
     /// mirrors the index-side gram split.
     fn query_terms(&self, query: &str) -> Vec<QueryTerm> {
-        let (tokens, cjk_words, bigrams) = grams_of(query);
+        let (tokens, bigrams) = grams_of(query);
         let mut terms: Vec<QueryTerm> = Vec::new();
         for t in tokens {
             if terms.iter().any(|x| x.kind == TermKind::Ascii && x.text == t) {
@@ -1172,14 +1351,14 @@ impl ContextIndex {
             // "zcod" query knows how many docs its expansion really covers.
             let mut merged: Vec<u32> = Vec::new();
             if t.chars().count() >= PREFIX_MIN_CHARS {
-                let end = format!("{t}\u{10FFFF}");
-                for (_, postings) in self.ascii.range(t.clone()..end) {
-                    merged.extend_from_slice(postings);
+                let end = format!("{t}\u{10FFFF}").into_boxed_str();
+                for (_, span) in self.ascii.range(t.clone().into_boxed_str()..end) {
+                    merged.extend(self.decode_postings(*span));
                 }
                 merged.sort_unstable();
                 merged.dedup();
-            } else if let Some(p) = self.ascii.get(&t) {
-                merged.extend_from_slice(p);
+            } else if let Some(span) = self.ascii.get(t.as_str()) {
+                merged.extend(self.decode_postings(*span));
             }
             let df = merged.len();
             terms.push(QueryTerm {
@@ -1190,26 +1369,36 @@ impl ContextIndex {
                 postings: merged,
             });
         }
-        for (text, kind) in cjk_words
-            .into_iter()
-            .map(|w| (w, TermKind::Word))
-            .chain(bigrams.into_iter().map(|g| (g, TermKind::Gram)))
-        {
-            if terms.iter().any(|x| x.kind == kind && x.text == text) {
+        for g in bigrams {
+            if terms.iter().any(|x| x.kind == TermKind::Gram && x.text == g) {
                 continue;
             }
-            let map = match kind {
-                TermKind::Word => &self.words,
-                _ => &self.cjk,
-            };
-            let df = map.get(&text).map_or(0, |p| p.len());
+            let df = self.cjk.get(g.as_str()).map_or(0, |s| s.len as usize);
             terms.push(QueryTerm {
                 idf: self.idf_of(df),
-                text,
-                kind,
+                text: g,
+                kind: TermKind::Gram,
                 df,
                 postings: Vec::new(),
             });
+        }
+        // A lone CJK char forms no bigram and matches no vocab entry, but its
+        // docs are still findable by substring: emit it as a df-0 Gram so the
+        // pool stage takes the verified full scan.
+        if terms.is_empty() {
+            let cjk_chars: Vec<char> = query
+                .chars()
+                .filter(|c| is_cjk(*c))
+                .collect();
+            if cjk_chars.len() == 1 {
+                terms.push(QueryTerm {
+                    text: cjk_chars[0].to_string(),
+                    kind: TermKind::Gram,
+                    df: 0,
+                    idf: 0.0,
+                    postings: Vec::new(),
+                });
+            }
         }
         terms
     }
@@ -1229,7 +1418,8 @@ impl ContextIndex {
                 // distribution is corpus glue even when the absolute line
                 // hasn't caught up with growth (tool layer tripled N).
                 if n_vocab > 0 && t.df > 64 {
-                    let greater = n_vocab - self.df_hist.partition_point(|&d| d <= t.df);
+                    let greater = n_vocab
+                        - self.df_hist.partition_point(|&d| (d as usize) <= t.df);
                     if (greater as f64) / (n_vocab as f64) <= 0.001 {
                         return false;
                     }
@@ -1257,13 +1447,11 @@ impl ContextIndex {
     }
 
     /// Candidate docs and the tier that produced them:
-    /// 1. hard AND over the rarest content terms (ASCII tokens + jieba
-    ///    words) — at most `POOL_TERMS_MAX` of them, so verbose queries stop
-    ///    demanding that every word of a sentence co-occur. A jieba word no
-    ///    doc-side cut produced is a soft miss, since query and corpus
-    ///    segment the same text differently all the time;
-    /// 2. hard AND over content character bigrams — catches fragments
-    ///    spanning word boundaries when the word tier found nothing;
+    /// 1. hard AND over the rarest content terms (ASCII tokens) — at most
+    ///    `POOL_TERMS_MAX` of them, so verbose queries stop demanding that
+    ///    every word of a sentence co-occur;
+    /// 2. hard AND over content character bigrams — the CJK tier, catching
+    ///    fragments that span any word boundary;
     /// 3. ranked OR by summed idf across all terms — the vague/typo tier.
     ///
     /// A precise query (≤ `POOL_TERMS_MAX` content terms) keeps the hard
@@ -1271,11 +1459,10 @@ impl ContextIndex {
     /// than letting soft CJK matches backfill noise. Verbose queries soften
     /// it — recall wins once the query is a sentence.
     fn candidate_pool(&self, terms: &[QueryTerm]) -> (Vec<u32>, u8, usize) {
-        // A lone CJK char the index never cut as a word ("税" against docs
-        // that only ever say 税务): a verified full scan is the only honest
-        // answer, and one term over pre-lowercased text stays cheap.
+        // A lone CJK char ("税" against docs that only ever say 税务) forms
+        // no bigram: a verified full scan is the only honest answer.
         if terms.len() == 1
-            && terms[0].kind == TermKind::Word
+            && terms[0].kind == TermKind::Gram
             && terms[0].text.chars().count() == 1
         {
             return ((0..self.docs.len() as u32).collect(), 1, 0);
@@ -1288,20 +1475,16 @@ impl ContextIndex {
         }
 
         let postings_of = |t: &QueryTerm| -> Vec<u32> {
-            match t.kind {
-                TermKind::Ascii => t.postings.clone(),
-                TermKind::Word => self.words.get(&t.text).cloned().unwrap_or_default(),
-                TermKind::Gram => self.cjk.get(&t.text).cloned().unwrap_or_default(),
-            }
+            let span = match t.kind {
+                TermKind::Ascii => return t.postings.clone(),
+                TermKind::Gram => self.cjk.get(t.text.as_str()),
+            };
+            span.map(|s| self.decode_postings(*s)).unwrap_or_default()
         };
 
-        // Tier 1: AND over the rarest content words. Grams are tier 2's job;
-        // mixing them in would only re-AND what their words already cover.
-        let mut drive: Vec<&QueryTerm> = content
-            .iter()
-            .filter(|t| t.kind != TermKind::Gram)
-            .copied()
-            .collect();
+        // Tier 1: AND over the rarest content terms — ASCII tokens and CJK
+        // bigrams alike, since both split identically on query and doc side.
+        let mut drive: Vec<&QueryTerm> = content.iter().copied().collect();
         if drive.len() > POOL_TERMS_MAX {
             drive.sort_by_key(|t| t.df); // rarest first; stable for ties
             drive.truncate(POOL_TERMS_MAX);
@@ -1324,7 +1507,7 @@ impl ContextIndex {
                 // best-first) so ranking, not the pool boundary, decides.
                 let mut backfill = 0usize;
                 if acc.len() < SOFT_AND_MIN_POOL {
-                    let mut seen: HashSet<u32> = acc.iter().copied().collect();
+                    let seen: HashSet<u32> = acc.iter().copied().collect();
                     // Collect non-AND candidates with their summed idf, keep
                     // the best SOFT_AND_BACKFILL_MAX — an unbounded tail made
                     // verify scan 8k docs and p95 hit 722ms (R4 first run).
@@ -1349,28 +1532,8 @@ impl ContextIndex {
             }
         }
 
-        // Tier 2: bigram AND over content grams.
-        let mut per_gram: Vec<Vec<u32>> = content
-            .iter()
-            .filter(|t| t.kind == TermKind::Gram)
-            .map(|t| postings_of(t))
-            .filter(|p| !p.is_empty())
-            .collect();
-        if !per_gram.is_empty() {
-            per_gram.sort_by_key(|v| v.len());
-            let mut acc = per_gram.remove(0);
-            for other in &per_gram {
-                if acc.is_empty() {
-                    break;
-                }
-                acc = and_merge(&acc, other);
-            }
-            if !acc.is_empty() {
-                return (acc, 2, 0);
-            }
-        }
-
-        // Tier 3: sum idf over every term's postings, best first. Left
+        // Tier 3 (tier 2 stays reserved for the retired jieba word tier,
+        // so historical search-log traces keep their meaning): sum idf over every term's postings, best first. Left
         // untruncated so the caller can record the true union size in the
         // trace before applying MAX_VERIFY_CANDIDATES.
         let bump: Vec<&QueryTerm> = if content.is_empty() {
@@ -1445,32 +1608,37 @@ impl ContextIndex {
         let idf_sum: f64 = scoring.iter().map(|t| t.idf).sum();
         let normalized_query = normalize(trimmed);
         let now = crate::now_ts();
-        let error_query = scoring.iter().any(|t| {
-            ["error", "fail", "panic", "exception", "失败", "报错", "错误", "异常"]
-                .iter()
-                .any(|k| t.text.contains(k))
-        });
-        let query_long_enough = normalized_query.chars().count() >= 24;
-        let query_prefix: String = normalized_query.chars().take(80).collect();
         let mut hits: Vec<SearchHit> = Vec::new();
         let mut hit_shingles: Vec<HashSet<u64>> = Vec::new();
         let mut candidates = 0usize;
 
         let t_verify = Instant::now();
+        // Filters resolve to interned ids once, so the per-candidate checks
+        // below are integer comparisons.
+        let src_filter = filter
+            .source
+            .and_then(|s| self.source_names.iter().position(|x| x.as_ref() == s));
+        let role_filter = filter.role.map(|r| if r == "user" { ROLE_USER } else { ROLE_ASSISTANT });
+        let excluded: Vec<u32> = filter
+            .exclude_sessions
+            .iter()
+            .filter_map(|s| self.sessions.iter().position(|x| x.as_ref() == *s))
+            .map(|p| p as u32)
+            .collect();
         for &idx in &pool {
             let meta = &self.docs[idx as usize];
-            if let Some(s) = filter.source {
-                if meta.source != s {
+            if let Some(s) = src_filter {
+                if meta.source as usize != s {
                     continue;
                 }
             }
-            if let Some(r) = filter.role {
+            if let Some(r) = role_filter {
                 if meta.role != r {
                     continue;
                 }
             }
             if let Some(p) = filter.project {
-                if project_label(&meta.project) != p {
+                if project_label(&self.projects[meta.project as usize]) != p {
                     continue;
                 }
             }
@@ -1479,13 +1647,15 @@ impl ContextIndex {
                     continue;
                 }
             }
-            if filter.exclude_sessions.iter().any(|x| *x == meta.session_id) {
+            if excluded.contains(&meta.session) {
                 continue;
             }
             candidates += 1;
 
-            let text = &self.texts[idx as usize];
-            let lower = &self.lows[idx as usize];
+            // Text decompresses per candidate — one doc at a time instead of
+            // the whole corpus twice (original + lowercased) at rest.
+            let text = self.doc_text(idx as usize);
+            let lower = text.to_lowercase();
             let mut matched_any = false;
             let mut matched_idf = 0.0f64;
             let mut total_occurrences = 0u32;
@@ -1524,37 +1694,18 @@ impl ContextIndex {
                 0.0
             };
             let role_w = match meta.role {
-                "user" => 0.9,
-                // Tool synopses are term-dense (paths, commands) and would
-                // out-rank the conversation they came from; they sit below
-                // assistant text unless phrase/density says otherwise.
-                "tool" => 0.35,
+                ROLE_USER => 0.9,
                 // Navigation aid: matched via the session's own task words.
-                "session_digest" => 0.45,
+                ROLE_DIGEST => 0.45,
                 _ => 0.5,
             };
             let age_days = ((now - meta.timestamp).max(0) / 86_400) as f64;
             let recency = 0.5f64.powf(age_days / 30.0);
 
-            // Verbatim-prefix boost (tool docs): a query that quotes the
-            // opening of a tool output verbatim — "Exit code 1\nTraceback…"
-            // — is the strongest retrieval intent there is, and the
-            // conversation docs that echo the same traceback must not bury
-            // the doc that produced it. Compared on normalized prefixes:
-            // raw text keeps newlines, queries don't.
-            let verbatim = query_long_enough
-                && meta.role == "tool"
-                && self.tool_prefixes.get(&idx).map_or(false, |p| p.starts_with(&query_prefix));
             // Phrase hits are the strongest single signal and must not be
             // diluted by coverage on long docs; density edges out coverage
             // there for the same reason.
             let mut score = 1.5 * coverage + 1.0 * density + 1.5 * phrase + role_w + 0.4 * recency;
-            if verbatim {
-                score += 0.8;
-            }
-            if meta.is_error && error_query {
-                score += 0.3;
-            }
             // O7 simplified: clicked docs come back. Log damping — the 50th
             // click on one doc must not make it unmovable.
             if let Some(c) = clicks.get(&meta.doc_id) {
@@ -1563,20 +1714,19 @@ impl ContextIndex {
                 }
             }
 
-            let snippet = extract_snippet(text, lower, first_pos.unwrap_or(0));
-            let shingles = shingles_of(text);
+            let snippet = extract_snippet(&text, &lower, first_pos.unwrap_or(0));
+            let shingles = shingles_of(&text);
             hits.push(SearchHit {
                 doc_id_str: meta.doc_id.to_string(),
-                source: meta.source.clone(),
-                session_id: meta.session_id.clone(),
-                role: meta.role,
+                source: self.source_names[meta.source as usize].to_string(),
+                session_id: self.sessions[meta.session as usize].to_string(),
+                role: ROLE_NAMES[meta.role as usize],
                 timestamp: meta.timestamp,
                 score,
                 snippet,
-                project: project_label(&meta.project),
+                project: project_label(&self.projects[meta.project as usize]),
                 title: self.session_title(meta),
                 truncated: meta.truncated,
-                equivalent: 0,
             });
             hit_shingles.push(shingles);
         }
@@ -1592,7 +1742,7 @@ impl ContextIndex {
         let mut digest_sessions: HashMap<String, f64> = HashMap::new();
         let mut session_headers: Vec<SearchHit> = Vec::new();
         hits.retain(|h| {
-            if h.role == "session_digest" {
+            if h.role == ROLE_NAMES[ROLE_DIGEST as usize] {
                 digest_sessions.insert(h.session_id.clone(), h.score);
                 session_headers.push(h.clone());
                 false
@@ -1694,11 +1844,14 @@ impl ContextIndex {
             let anchor = &kept[pos];
             let (src, before_ts, base_score, doc_id) =
                 (anchor.source.as_str(), anchor.timestamp, anchor.score, anchor.doc_id_str.clone());
+            let src_id = self.source_names.iter().position(|x| x.as_ref() == src);
+            let sess_id = self.sessions.iter().position(|x| x.as_ref() == sid);
+            let (Some(src_id), Some(sess_id)) = (src_id, sess_id) else { continue };
             let mut best: Option<usize> = None;
             for (i, d) in self.docs.iter().enumerate() {
-                if d.source == src
-                    && d.session_id == sid
-                    && d.role == "user"
+                if d.source as usize == src_id
+                    && d.session as usize == sess_id
+                    && d.role == ROLE_USER
                     && d.timestamp <= before_ts
                     && best.map_or(true, |b| self.docs[b].timestamp <= d.timestamp)
                 {
@@ -1710,63 +1863,26 @@ impl ContextIndex {
             if meta.doc_id.to_string() == doc_id {
                 continue;
             }
-            let text = &self.texts[ui];
-            let lower = &self.lows[ui];
+            let text = self.doc_text(ui);
+            let lower = text.to_lowercase();
             injected.insert(sid);
             insertions.push((pos + 1, SearchHit {
                 doc_id_str: meta.doc_id.to_string(),
-                source: meta.source.clone(),
-                session_id: meta.session_id.clone(),
-                role: meta.role,
+                source: self.source_names[meta.source as usize].to_string(),
+                session_id: self.sessions[meta.session as usize].to_string(),
+                role: ROLE_NAMES[meta.role as usize],
                 timestamp: meta.timestamp,
                 score: base_score - 0.01,
-                snippet: extract_snippet(text, lower, 0),
-                project: project_label(&meta.project),
+                snippet: extract_snippet(&text, &lower, 0),
+                project: project_label(&self.projects[meta.project as usize]),
                 title: self.session_title(meta),
                 truncated: meta.truncated,
-                equivalent: 0,
             }));
         }
         for (pos, hit) in insertions.into_iter().rev() {
             kept.insert(pos, hit);
         }
-        // Per-session diversification, tool docs only: synopses share the
-        // query's file-path vocabulary and would flood the page. Conversation
-        // hits keep baseline behavior (the fold pass already de-echoes them).
-        let mut per_session: HashMap<String, usize> = HashMap::new();
-        // O23 content-equivalence grouping: among tool hits sharing an
-        // equivalence prefix (same output, other sessions/turns), keep the
-        // best-scoring one and count the rest on its `equivalent` badge.
-        let mut equiv_count: HashMap<String, usize> = HashMap::new();
-        for h in kept.iter() {
-            if h.role == "tool" {
-                if let Some(p) = h.doc_id_str.parse::<i64>().ok().and_then(|id| self.equiv_by_doc.get(&id)) {
-                    *equiv_count.entry(p.clone()).or_default() += 1;
-                }
-            }
-        }
-        let mut per_session: HashMap<String, usize> = HashMap::new();
-        let mut seen_equiv: HashSet<String> = HashSet::new();
-        let mut diversified: Vec<SearchHit> = Vec::with_capacity(kept.len());
-        for mut hit in kept {
-            if hit.role == "tool" {
-                if let Some(p) = hit.doc_id_str.parse::<i64>().ok().and_then(|id| self.equiv_by_doc.get(&id)) {
-                    if !seen_equiv.insert(p.clone()) {
-                        deduped += 1;
-                        continue;
-                    }
-                    hit.equivalent = equiv_count.get(p).copied().unwrap_or(1) - 1;
-                }
-                let c = per_session.entry(hit.session_id.clone()).or_default();
-                if *c >= 3 {
-                    deduped += 1;
-                    continue;
-                }
-                *c += 1;
-            }
-            diversified.push(hit);
-        }
-        hits = diversified;
+        hits = kept;
         hits.truncate(filter.limit.max(1));
         let returned = hits.len();
 
@@ -1885,10 +2001,6 @@ pub struct SearchHit {
     /// Session display name: the tool's title or the first user message.
     pub title: String,
     pub truncated: bool,
-    /// R5.5 (O23): other results merged into this one because their indexed
-    /// text is content-equivalent (same 80-char normalized head). 0 = unique.
-    #[serde(default)]
-    pub equivalent: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1999,8 +2111,6 @@ pub struct ContextStatus {
 
 pub struct ContextHandle {
     parquet_path: PathBuf,
-    /// Tool-event store (T0 layer), synced alongside the conversation cache.
-    tools_path: PathBuf,
     /// `search-log.jsonl` next to the parquet: one line per query, so real
     /// traffic accumulates as raw material for regression cases and tuning.
     search_log_path: PathBuf,
@@ -2054,12 +2164,10 @@ fn append_search_line(path: &Path, line: &str, rotate_over: u64) -> std::io::Res
 impl ContextHandle {
     pub fn new(parquet_path: PathBuf) -> Self {
         let search_log_path = parquet_path.with_file_name("search-log.jsonl");
-        let tools_path = parquet_path.with_file_name("tools.parquet");
         let clicks_path = parquet_path.with_file_name("clicks.json");
         let clicks = Self::load_clicks(&clicks_path);
         Self {
             parquet_path,
-            tools_path,
             search_log_path,
             clicks_path,
             clicks: RwLock::new(clicks),
@@ -2151,38 +2259,33 @@ impl ContextHandle {
         inner.status.detail = detail;
     }
 
-    /// Incremental collect+dedupe (conversations + tool blocks), then rebuild
-    /// the index and swap it in. `clear` drops the stored parquet first (full
-    /// rebuild). Tool-store failures don't block the conversation sync — the
-    /// tool layer is additive and the next sync retries it.
+    /// Incremental collect+dedupe of conversations, then rebuild the index
+    /// and swap it in. `clear` drops the stored parquet first (full rebuild).
     pub fn sync_and_build(&self, clear: bool) -> Result<SyncStats> {
         self.set_phase(Phase::Syncing, None);
         if clear {
             let _ = std::fs::remove_file(&self.parquet_path);
-            let _ = std::fs::remove_file(&self.tools_path);
         }
-        let mut stats = match sync_context(&self.parquet_path, false) {
+        // One-time cleanup: the tool-output store this path fed was removed
+        // from the index (it tripled index memory for content the search
+        // already finds in the conversation docs); drop the derived file too.
+        let _ = std::fs::remove_file(self.parquet_path.with_file_name("tools.parquet"));
+        let stats = match sync_context(&self.parquet_path, false) {
             Ok(s) => s,
             Err(e) => {
                 self.set_phase(Phase::Failed, Some(e.to_string()));
                 return Err(e);
             }
         };
-        match crate::tools::sync_tools(
-            &self.tools_path,
-            false,
-            crate::tools::collect_all_tool_events(),
-        ) {
-            Ok(t) => {
-                stats.tool_collected = t.collected;
-                stats.tool_imported = t.imported;
-                stats.tool_id_dup_skipped = t.id_dup_skipped;
-                stats.tool_content_dup_skipped = t.content_dup_skipped;
-                stats.tool_total = t.total;
-            }
-            Err(e) => eprintln!("[TokenBuddy] context: tools sync failed (non-fatal): {e}"),
-        }
         self.set_phase(Phase::Building, None);
+        {
+            // Drop the old index before building the replacement: the OS does
+            // not return freed small allocations, so peak — not steady-state —
+            // is what sets the process footprint. Search reports the building
+            // phase for the few seconds this takes.
+            let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            inner.index = None;
+        }
         match ContextIndex::build(&self.parquet_path) {
             Ok(index) => {
                 let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
@@ -2320,33 +2423,28 @@ mod tests {
 
     #[test]
     fn grams_handle_mixed_script() {
-        let (tokens, words, bigrams) = grams_of("修复 Context 搜索bug");
+        let (tokens, bigrams) = grams_of("修复 Context 搜索bug");
         assert_eq!(tokens, vec!["context", "bug"]);
-        assert_eq!(words, vec!["修复", "搜索"]);
         assert_eq!(bigrams, vec!["修复", "搜索"]);
     }
 
     #[test]
-    fn grams_cut_cjk_with_jieba() {
-        // jieba's dict keeps 重新安装 whole; the point is that this is the
-        // word tier, not the raw bigram sequence 重新/新安/安装/装依/依赖.
-        let (_, words, bigrams) = grams_of("重新安装依赖");
-        assert_eq!(words, vec!["重新安装", "依赖"]);
-        assert_eq!(bigrams.len(), 5);
+    fn grams_cut_cjk_into_bigrams() {
+        let (_, bigrams) = grams_of("重新安装依赖");
+        assert_eq!(bigrams, vec!["重新", "新安", "安装", "装依", "依赖"]);
     }
 
     #[test]
     fn grams_keep_snake_case_whole_and_lowercase() {
-        let (tokens, _, bigrams) = grams_of("read_existing_doc_ids 上下文");
+        let (tokens, bigrams) = grams_of("read_existing_doc_ids 上下文");
         assert_eq!(tokens, vec!["read_existing_doc_ids"]);
         assert_eq!(bigrams, vec!["上下", "下文"]);
     }
 
     #[test]
-    fn grams_of_lone_cjk_char_is_a_word() {
-        let (tokens, words, bigrams) = grams_of("税");
+    fn grams_of_lone_cjk_char_yields_nothing() {
+        let (tokens, bigrams) = grams_of("税");
         assert!(tokens.is_empty() && bigrams.is_empty());
-        assert_eq!(words, vec!["税"]);
     }
 
     #[test]
