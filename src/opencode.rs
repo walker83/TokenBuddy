@@ -36,14 +36,82 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
     // checkpointed recently. We only issue SELECTs so the RW handle is safe.
     let conn = rusqlite::Connection::open(db_path)?;
 
-    let mut stmt = conn.prepare(
-        "SELECT id, session_id, time_created, data FROM message ORDER BY time_created ASC",
-    )?;
+    // OpenCode shipped two SQLite shapes:
+    //   - v1 (<= ~2025): table `message` with role + token counts inside JSON.
+    //   - v2 (>= 2026): table `session_message` per-message rows but token
+    //     counts lifted onto `session_v2` (one row per session, message
+    //     bodies flattened into `data.content[]` without a per-message
+    //     `tokens` object). See PR feat/opencode-v2-on-gitea.
+    // Detect at runtime so both stay supported without forcing users onto
+    // a specific OpenCode version.
+    let (sql, is_v2) = if crate::context::sqlite_table_exists(&conn, "session_message") {
+        // v2 — token counts live on session_v2, one row per session.
+        (
+            "SELECT s.id, s.time_created, s.model, s.agent, \
+                    s.tokens_input, s.tokens_output, s.tokens_cache_read, s.tokens_cache_write \
+             FROM session_v2 s \
+             WHERE s.tokens_input > 0 OR s.tokens_output > 0 \
+             ORDER BY s.time_created ASC",
+            true,
+        )
+    } else if crate::context::sqlite_table_exists(&conn, "message") {
+        // v1 — per-message rows, role + tokens in `data` JSON.
+        (
+            "SELECT id, session_id, time_created, data \
+             FROM message \
+             ORDER BY time_created ASC",
+            false,
+        )
+    } else {
+        // Neither table present — nothing to read; surface as empty so
+        // the collector quietly moves on instead of blowing up.
+        return Ok(Vec::new());
+    };
+
+    let mut stmt = conn.prepare(sql)?;
 
     let mut records = Vec::new();
     let mut rows = stmt.query([])?;
 
     while let Some(row) = rows.next()? {
+        if is_v2 {
+            // v2 path: aggregate per-session rollup from session_v2.
+            let session_id: String = row.get(0)?;
+            let time_created_ms: i64 = row.get(1)?;
+            let model_raw: String = row.get(2)?;
+            let agent: String = row.get(3)?;
+            let input_tokens: u64 = row.get(4)?;
+            let output_tokens: u64 = row.get(5)?;
+            let cache_read: u64 = row.get(6)?;
+            let cache_write: u64 = row.get(7)?;
+            // v2 `model` is JSON `{"id":"...","providerID":"opencode","variant":"..."}`.
+            let model_id = serde_json::from_str::<serde_json::Value>(&model_raw)
+                .ok()
+                .and_then(|v| v.get("id").and_then(|x| x.as_str()).map(String::from))
+                .unwrap_or_else(|| model_raw.clone());
+            let model_label = if agent.is_empty() {
+                model_id
+            } else {
+                format!("{}/{}", agent, model_id)
+            };
+            records.push(TokenRecord {
+                source: Source::OpenCode,
+                model: model_label,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens: cache_read,
+                cache_creation_tokens: cache_write,
+                timestamp: time_created_ms / 1000,
+                session_id: Some(session_id),
+                duration_ms: None,
+                ttft_ms: None,
+                credits: 0.0,
+                context_ratio: 0.0,
+                record_id: None,
+            });
+            continue;
+        }
+
         let _msg_id: String = row.get(0)?;
         let session_id: String = row.get(1)?;
         let time_created: i64 = row.get(2)?;
@@ -99,8 +167,19 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
             .get("time")
             .and_then(|t| t.get("completed"))
             .and_then(|c| c.as_i64())
-            .zip(value.get("time").and_then(|t| t.get("created")).and_then(|c| c.as_i64()))
-            .and_then(|(end, start)| if end >= start { Some((end - start) as u64) } else { None });
+            .zip(
+                value
+                    .get("time")
+                    .and_then(|t| t.get("created"))
+                    .and_then(|c| c.as_i64()),
+            )
+            .and_then(|(end, start)| {
+                if end >= start {
+                    Some((end - start) as u64)
+                } else {
+                    None
+                }
+            });
 
         records.push(TokenRecord {
             source: Source::OpenCode,
@@ -114,6 +193,7 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
             duration_ms,
             ttft_ms: None,
             credits: 0.0,
+            context_ratio: 0.0,
             record_id: None,
         });
     }

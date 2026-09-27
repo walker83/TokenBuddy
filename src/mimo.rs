@@ -98,8 +98,19 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
             .get("time")
             .and_then(|t| t.get("completed"))
             .and_then(|c| c.as_i64())
-            .zip(value.get("time").and_then(|t| t.get("created")).and_then(|c| c.as_i64()))
-            .and_then(|(end, start)| if end >= start { Some((end - start) as u64) } else { None });
+            .zip(
+                value
+                    .get("time")
+                    .and_then(|t| t.get("created"))
+                    .and_then(|c| c.as_i64()),
+            )
+            .and_then(|(end, start)| {
+                if end >= start {
+                    Some((end - start) as u64)
+                } else {
+                    None
+                }
+            });
 
         records.push(TokenRecord {
             source: Source::Mimo,
@@ -113,6 +124,7 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
             duration_ms,
             ttft_ms: None,
             credits: 0.0,
+            context_ratio: 0.0,
             record_id: None,
         });
     }

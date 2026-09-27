@@ -12,7 +12,7 @@
 //! (`<home>/logs/sessions/<slug>/<session>/segments/*.jsonl`, `turn.finished`
 //! events), correlated back by `usage.request_id`.
 
-use crate::{file_mtime, Source, TokenRecord};
+use crate::{file_mtime, FileCacheMap, Source, TokenRecord};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-static FILE_CACHE: Mutex<Option<HashMap<String, (SystemTime, Vec<TokenRecord>)>>> = Mutex::new(None);
+static FILE_CACHE: Mutex<Option<FileCacheMap>> = Mutex::new(None);
 
 pub fn collect_records() -> Result<Vec<TokenRecord>> {
     let homes = get_qoder_homes();
@@ -135,6 +135,69 @@ fn collect_turn_durations(homes: &[PathBuf]) -> HashMap<String, i64> {
     durations
 }
 
+/// Per-session activity counters from the same runtime logs the duration join
+/// walks: `(model_responses, user_prompts, turns, tool_calls)`. Sessions that
+/// never produce a billable record — BYOK, where Qoder reports no usage at
+/// all — still log every event, so these counters are the only trace they
+/// leave; the insights session leaderboard merges them instead of dropping
+/// such sessions on the floor.
+pub fn runtime_session_counts() -> HashMap<String, (u64, u64, u64, u64)> {
+    let homes = get_qoder_homes();
+    let mut out = HashMap::new();
+    for home in &homes {
+        count_runtime_in(&home.join("logs").join("sessions"), &mut out);
+    }
+    out
+}
+
+fn count_runtime_in(sessions_dir: &Path, out: &mut HashMap<String, (u64, u64, u64, u64)>) {
+    let Ok(slugs) = fs::read_dir(sessions_dir) else {
+        return;
+    };
+    for slug in slugs.flatten() {
+        let Ok(sessions) = fs::read_dir(slug.path()) else {
+            continue;
+        };
+        for session in sessions.flatten() {
+            let session_dir = session.path();
+            if !session_dir.is_dir() {
+                continue;
+            }
+            let Some(sid) = session_dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let counter = out.entry(sid.to_string()).or_insert((0, 0, 0, 0));
+            let Ok(segments) = fs::read_dir(session_dir.join("segments")) else {
+                continue;
+            };
+            for segment in segments.flatten() {
+                let path = segment.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Ok(file) = fs::File::open(&path) else {
+                    continue;
+                };
+                for line in BufReader::new(file).lines().map_while(|l| l.ok()) {
+                    if !line.contains("\"type\"") {
+                        continue;
+                    }
+                    let Ok(t) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+                    match t.get("type").and_then(|v| v.as_str()) {
+                        Some("model.response.completed") => counter.0 += 1,
+                        Some("input.prompt.submitted") => counter.1 += 1,
+                        Some("turn.finished") => counter.2 += 1,
+                        Some("tool.requested") => counter.3 += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn collect_turn_durations_in(sessions_dir: &Path, out: &mut HashMap<String, i64>) {
     let Ok(entries) = fs::read_dir(sessions_dir) else {
         return;
@@ -161,7 +224,9 @@ fn collect_turn_durations_in(sessions_dir: &Path, out: &mut HashMap<String, i64>
                 if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
                 }
-                let Ok(file) = fs::File::open(&path) else { continue };
+                let Ok(file) = fs::File::open(&path) else {
+                    continue;
+                };
                 for line in BufReader::new(file).lines().map_while(|l| l.ok()) {
                     if !line.contains("turn.finished") {
                         continue;
@@ -192,6 +257,37 @@ fn collect_turn_durations_in(sessions_dir: &Path, out: &mut HashMap<String, i64>
             }
         }
     }
+}
+
+/// Qoder masks model ids to opaque keys (`qmodel`, `qfmodel`, …) in every
+/// local log. The app's own model-config cache — QoderCN globalStorage
+/// `aicoding.modelConfigs.cache.*`, read 2026-09 — maps them to display names
+/// in plaintext; the table below is that catalog. Unknown keys (a newly
+/// shipped model, or `byok:<profile-uuid>` for bring-your-own-key sessions)
+/// pass through unchanged rather than being guessed.
+fn demask_model(model: &str) -> String {
+    const CATALOG: &[(&str, &str)] = &[
+        ("qmodel_38max", "Qwen3.8-Max"),
+        ("qmodel_latest", "Qwen3.7-Max"),
+        ("qmodel", "Qwen3.7-Plus"),
+        ("qfmodel", "Qwen3.8-Flash"),
+        ("q37fmodel", "Qwen3.7-Flash"),
+        ("dmodel", "DeepSeek-V4-Pro"),
+        ("dfmodel", "DeepSeek-V4-Flash"),
+        ("gmodel", "GLM-5.3"),
+        ("gfmodel", "GLM-5.3-Flash"),
+        ("gm51model", "GLM-5.2"),
+        ("kmodel", "Kimi-K2.7-Code"),
+        ("mmodel", "MiniMax-M2.7"),
+    ];
+    // Longest-key-first is implicit in table order: `qmodel_38max` must win
+    // over the `qmodel` prefix.
+    for (key, name) in CATALOG {
+        if model == *key {
+            return name.to_string();
+        }
+    }
+    model.to_string()
 }
 
 fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
@@ -225,8 +321,14 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
             None => continue,
         };
 
-        let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let input_tokens = usage
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let output_tokens = usage
+            .get("output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let cache_read_tokens = usage
             .get("cache_read_input_tokens")
             .and_then(|v| v.as_u64())
@@ -236,12 +338,25 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         let credits = usage.get("credits").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // The only token-scale figure Qoder reports unmasked: fraction of the
+        // context window this request consumed (0..=1). The token counts stay
+        // zeroed server-side, so this is the "context fill" signal the
+        // dashboard shows for the source.
+        let context_ratio = usage
+            .get("context_usage_ratio")
+            .and_then(|v| v.as_f64())
+            .filter(|r| (0.0..=1.0).contains(r))
+            .unwrap_or(0.0);
 
         // Qoder marks free/cancelled turns non-billable with everything zeroed;
         // counting them would inflate request counts without any usage.
-        let has_usage = input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens > 0;
-        let billable = usage.get("billable").and_then(|v| v.as_bool()).unwrap_or(false);
-        if !has_usage && !(billable && credits > 0.0) {
+        let has_usage =
+            input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens > 0;
+        let billable = usage
+            .get("billable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !(has_usage || (billable && credits > 0.0)) {
             continue;
         }
 
@@ -256,24 +371,32 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
             .or_else(|| file_mtime(file_path))
             .unwrap_or(0);
 
-        let request_id = usage.get("request_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let request_id = usage
+            .get("request_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         records.push(TokenRecord {
             source: Source::Qoder,
-            model: message
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
+            model: demask_model(
+                message
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
+            ),
             input_tokens,
             output_tokens,
             cache_read_tokens,
             cache_creation_tokens,
             timestamp,
-            session_id: value.get("sessionId").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            session_id: value
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             duration_ms: None,
             ttft_ms: None,
             credits,
+            context_ratio,
             // The request id doubles as the dedupe key and the join key back to
             // the runtime log's per-turn duration.
             record_id: request_id,
@@ -317,7 +440,9 @@ pub fn drain_messages(sink: &mut dyn FnMut(crate::context::ContextMessage)) {
 
             for line_result in BufReader::new(file).lines() {
                 let Ok(line) = line_result else { continue };
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
 
                 if session_id.is_empty() {
                     session_id = value
@@ -331,7 +456,9 @@ pub fn drain_messages(sink: &mut dyn FnMut(crate::context::ContextMessage)) {
                     Some("assistant") => "assistant",
                     _ => continue,
                 };
-                let Some(message) = value.get("message") else { continue };
+                let Some(message) = value.get("message") else {
+                    continue;
+                };
                 let timestamp = value
                     .get("timestamp")
                     .and_then(|v| v.as_str())
@@ -358,7 +485,7 @@ pub fn drain_messages(sink: &mut dyn FnMut(crate::context::ContextMessage)) {
                         timestamp,
                         text,
                         project: project.clone(),
-                    title: String::new(),
+                        title: String::new(),
                     });
                 }
             }
@@ -372,11 +499,31 @@ pub fn drain_messages(sink: &mut dyn FnMut(crate::context::ContextMessage)) {
 // simply yield nothing.
 // ============================================================
 
-
 /// Collect into a vector; the sync path uses [`drain_messages`] so a source's
 /// messages are absorbed one at a time instead of all living at once.
 pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
     let mut msgs = Vec::new();
     drain_messages(&mut |m| msgs.push(m));
     msgs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::demask_model;
+
+    /// The catalog is matched by exact key, so the `qmodel` entry must not
+    /// swallow `qmodel_38max`, and anything not in the catalog — a future
+    /// model key, or a BYOK profile id — comes back untouched instead of
+    /// being mapped to a guess.
+    #[test]
+    fn masked_keys_map_to_catalog_display_names() {
+        assert_eq!(demask_model("qmodel"), "Qwen3.7-Plus");
+        assert_eq!(demask_model("qmodel_38max"), "Qwen3.8-Max");
+        assert_eq!(demask_model("qfmodel"), "Qwen3.8-Flash");
+        assert_eq!(demask_model("gmodel"), "GLM-5.3");
+        assert_eq!(demask_model("kmodel"), "Kimi-K2.7-Code");
+        assert_eq!(demask_model("byok:00000000-1111"), "byok:00000000-1111");
+        assert_eq!(demask_model("zmodel-2099"), "zmodel-2099");
+        assert_eq!(demask_model("unknown"), "unknown");
+    }
 }

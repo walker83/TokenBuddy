@@ -1,6 +1,5 @@
 use crate::file_mtime;
-use crate::TokenRecord;
-use crate::Source;
+use crate::{FileCacheMap, Source, TokenRecord};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -9,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-static FILE_CACHE: Mutex<Option<HashMap<String, (SystemTime, Vec<TokenRecord>)>>> = Mutex::new(None);
+static FILE_CACHE: Mutex<Option<FileCacheMap>> = Mutex::new(None);
 
 struct ParsedAssistantUsage {
     #[allow(dead_code)]
@@ -158,12 +157,30 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string(),
-            input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            cache_read_tokens: usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            cache_creation_tokens: usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            stop_reason: message.get("stop_reason").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            timestamp: value.get("timestamp").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            input_tokens: usage
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_read_tokens: usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_creation_tokens: usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            stop_reason: message
+                .get("stop_reason")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            timestamp: value
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             session_id: current_session_id.clone(),
         };
 
@@ -211,6 +228,7 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
             duration_ms: None,
             ttft_ms: None,
             credits: 0.0,
+            context_ratio: 0.0,
             record_id: None,
         });
     }
@@ -257,16 +275,16 @@ fn extract_messages_from_file(file_path: &Path) -> Vec<crate::context::ContextMe
 
     for line_result in BufReader::new(file).lines() {
         let Ok(line) = line_result else { continue };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
 
         if session_id.is_empty() {
             if let Some(sid) = value.get("sessionId").and_then(|v| v.as_str()) {
                 session_id = sid.to_string();
             }
         }
-        if title.is_empty()
-            && value.get("type").and_then(|t| t.as_str()) == Some("summary")
-        {
+        if title.is_empty() && value.get("type").and_then(|t| t.as_str()) == Some("summary") {
             if let Some(s) = value.get("summary").and_then(|v| v.as_str()) {
                 title = s.to_string();
             }
@@ -325,7 +343,6 @@ fn content_text(content: Option<&serde_json::Value>) -> String {
 // ============================================================
 // Tool events (R1 of the context-search blueprint)
 // ============================================================
-
 
 /// Collect into a vector; the sync path uses [`drain_messages`] so a source's
 /// messages are absorbed one at a time instead of all living at once.

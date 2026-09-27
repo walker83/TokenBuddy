@@ -18,10 +18,7 @@ fn main() -> anyhow::Result<()> {
     phase("1-startup");
     let index = tokenbuddy::context::ContextIndex::build(&path)?;
     let stats = index.stats();
-    eprintln!(
-        "docs={} approx_bytes={}",
-        stats.docs, stats.approx_bytes
-    );
+    eprintln!("docs={} approx_bytes={}", stats.docs, stats.approx_bytes);
     phase("3-index-steady");
     drop(index);
     phase("4-index-dropped");

@@ -1,0 +1,23 @@
+name: ci
+
+# One workflow serves both remotes: Gitea Actions reads .github/workflows/
+# exactly like GitHub does. The `container:` pin keeps the toolchain identical
+# on either runner and respects the repo's release-only build discipline via
+# scripts/check.sh (no debug artifacts anywhere).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Quality gate (fmt + clippy + tests + binary size guard)
+        run: scripts/check.sh
+      - name: Report binary size
+        run: du -h target/release/tokenbuddy

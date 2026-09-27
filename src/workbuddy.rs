@@ -11,7 +11,7 @@
 //! Spans carry no usage fields, and traces without `modelInfo` made no model
 //! calls, so those are skipped.
 
-use crate::{file_mtime, Source, TokenRecord};
+use crate::{file_mtime, FileCacheMap, Source, TokenRecord};
 use anyhow::Result;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-static FILE_CACHE: Mutex<Option<HashMap<String, (SystemTime, Vec<TokenRecord>)>>> = Mutex::new(None);
+static FILE_CACHE: Mutex<Option<FileCacheMap>> = Mutex::new(None);
 
 pub fn collect_records() -> Result<Vec<TokenRecord>> {
     let traces_dir = get_workbuddy_dir().join("traces");
@@ -159,7 +159,10 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
         _ => "unknown".to_string(),
     };
 
-    let record_id = trace.get("traceId").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let record_id = trace
+        .get("traceId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     Ok(vec![TokenRecord {
         source: Source::WorkBuddy,
@@ -169,10 +172,14 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
         cache_read_tokens: cache_read,
         cache_creation_tokens: 0,
         timestamp,
-        session_id: trace.get("sessionId").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        session_id: trace
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         duration_ms: trace.get("duration").and_then(|v| v.as_u64()),
         ttft_ms: None,
         credits: 0.0,
+        context_ratio: 0.0,
         record_id,
     }])
 }
@@ -199,8 +206,11 @@ fn repair_lone_surrogates(text: &str) -> Cow<'_, str> {
         };
         let esc = &b[i..i + 6];
         let is_low = |u: u16| (0xDC00..=0xDFFF).contains(&u);
-        let pair = (0xD800..=0xDBFF).contains(&unit).then(|| escape_at(b, i + 6)).flatten();
-        if pair.is_some_and(|low| is_low(low)) {
+        let pair = (0xD800..=0xDBFF)
+            .contains(&unit)
+            .then_some(escape_at(b, i + 6))
+            .flatten();
+        if pair.is_some_and(is_low) {
             out.extend_from_slice(&b[i..i + 12]);
             i += 12;
         } else if is_low(unit) || (0xD800..=0xDBFF).contains(&unit) {
@@ -214,7 +224,10 @@ fn repair_lone_surrogates(text: &str) -> Cow<'_, str> {
     }
 
     if repaired {
-        Cow::Owned(String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()))
+        Cow::Owned(
+            String::from_utf8(out)
+                .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()),
+        )
     } else {
         Cow::Borrowed(text)
     }
@@ -231,34 +244,6 @@ fn escape_at(b: &[u8], p: usize) -> Option<u16> {
     }
     let s = std::str::from_utf8(hex).ok()?;
     u16::from_str_radix(s, 16).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse(text: &str) -> serde_json::Result<serde_json::Value> {
-        serde_json::from_str(&repair_lone_surrogates(text))
-    }
-
-    #[test]
-    fn lone_surrogates_become_replacement_char() {
-        for bad in [r#"{"m":"x \ud83d y"}"#, r#"{"m":"x \udc00 y"}"#] {
-            assert!(serde_json::from_str::<serde_json::Value>(bad).is_err());
-            assert_eq!(parse(bad).unwrap()["m"], "x \u{FFFD} y");
-        }
-    }
-
-    #[test]
-    fn valid_escapes_pass_through() {
-        for good in [
-            r#"{"m":"😀 \ud83d\ude00 \u0041"}"#,
-            r#"{"m":"literal \\ud83d text"}"#,
-        ] {
-            assert!(matches!(repair_lone_surrogates(good), Cow::Borrowed(_)));
-            assert_eq!(parse(good).unwrap(), serde_json::from_str::<serde_json::Value>(good).unwrap());
-        }
-    }
 }
 
 /// Conversational text for context search, read out of the generation spans.
@@ -278,12 +263,16 @@ pub fn drain_messages(sink: &mut dyn FnMut(crate::context::ContextMessage)) {
     }
 
     for file_path in collect_trace_files(&traces_dir) {
-        let Ok(text) = fs::read_to_string(&file_path) else { continue };
+        let Ok(text) = fs::read_to_string(&file_path) else {
+            continue;
+        };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&repair_lone_surrogates(&text))
         else {
             continue;
         };
-        let Some(spans) = value.get("spans").and_then(|v| v.as_array()) else { continue };
+        let Some(spans) = value.get("spans").and_then(|v| v.as_array()) else {
+            continue;
+        };
         let session_id = value
             .get("trace")
             .and_then(|t| t.get("sessionId").or_else(|| t.get("traceId")))
@@ -360,7 +349,12 @@ fn assistant_reply(tool_output: Option<&str>) -> Option<String> {
     };
     let mut out = Vec::new();
     for item in items {
-        for choice in item.get("choices").and_then(|c| c.as_array()).into_iter().flatten() {
+        for choice in item
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+        {
             if let Some(content) = choice
                 .get("message")
                 .and_then(|m| m.get("content"))
@@ -392,11 +386,41 @@ fn unescape_prompt_literals(text: &str) -> String {
 // where it gets structured.
 // ============================================================
 
-
 /// Collect into a vector; the sync path uses [`drain_messages`] so a source's
 /// messages are absorbed one at a time instead of all living at once.
 pub fn collect_messages() -> Vec<crate::context::ContextMessage> {
     let mut msgs = Vec::new();
     drain_messages(&mut |m| msgs.push(m));
     msgs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> serde_json::Result<serde_json::Value> {
+        serde_json::from_str(&repair_lone_surrogates(text))
+    }
+
+    #[test]
+    fn lone_surrogates_become_replacement_char() {
+        for bad in [r#"{"m":"x \ud83d y"}"#, r#"{"m":"x \udc00 y"}"#] {
+            assert!(serde_json::from_str::<serde_json::Value>(bad).is_err());
+            assert_eq!(parse(bad).unwrap()["m"], "x \u{FFFD} y");
+        }
+    }
+
+    #[test]
+    fn valid_escapes_pass_through() {
+        for good in [
+            r#"{"m":"😀 \ud83d\ude00 \u0041"}"#,
+            r#"{"m":"literal \\ud83d text"}"#,
+        ] {
+            assert!(matches!(repair_lone_surrogates(good), Cow::Borrowed(_)));
+            assert_eq!(
+                parse(good).unwrap(),
+                serde_json::from_str::<serde_json::Value>(good).unwrap()
+            );
+        }
+    }
 }

@@ -9,7 +9,7 @@
   --bg: #ffffff; --panel: #ffffff; --panel2: #f5f5f7; --border: #e8e8ed;
   --text: #1d1d1f; --muted: #6e6e73; --faint: #86868b;
   --claude: #0071e3; --opencode: #34a853; --mimo: #9a4ddb; --zcode: #e8820c;
-  --pi: #0ea5a0; --qoder: #e0447c; --workbuddy: #5e6ad2;
+  --pi: #0ea5a0; --qoder: #e0447c; --workbuddy: #5e6ad2; --minimax: #d93025;
   --ok: #248a3d; --over: #d70015; --link: #0066cc;
   --ring: rgba(0, 113, 227, .18);
   --shadow: 0 1px 8px rgba(0, 0, 0, .05);
@@ -159,6 +159,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI'
 .ctx-expand:hover { background: rgba(0, 113, 227, .14); border-color: rgba(0, 113, 227, .6); }
 .ctx-expand:active { transform: scale(.95); }
 .ctx-expand.open { background: #0071e3; border-color: #0071e3; color: #fff; }
+.sess-link { color: var(--link); cursor: pointer; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.sess-link:hover { text-decoration: underline; }
+.nometer-badge { display: inline-block; margin-left: 5px; padding: 1px 7px; border-radius: 999px; font-size: 10.5px; font-weight: 600; color: #b25000; background: rgba(224, 138, 60, .12); border: 1px solid rgba(224, 138, 60, .35); vertical-align: 1px; }
 .ctx-session { background: #fff; border: 1px solid var(--border); border-radius: 16px; padding: 16px; margin: 0 0 10px 0; max-height: 520px; overflow-y: auto; animation: fadeUp .3s var(--ease) both; }
 .ctx-session-head { display: flex; gap: 10px; align-items: center; font-size: 11.5px; color: var(--muted); margin-bottom: 10px; flex-wrap: wrap; }
 
@@ -409,6 +412,7 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
       <option value="pi">Pi</option>
       <option value="qoder">Qoder</option>
       <option value="workbuddy">WorkBuddy</option>
+      <option value="minimax">MiniMax</option>
     </select>
     <select id="ctxRole" class="select">
       <option value="all">全部角色</option>
@@ -477,6 +481,7 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
       <option value="pi">Pi</option>
       <option value="qoder">Qoder</option>
       <option value="workbuddy">WorkBuddy</option>
+      <option value="minimax">MiniMax</option>
     </select>
     <input type="text" id="modelFilter" placeholder="按模型过滤…" style="width:180px">
   </div>
@@ -508,6 +513,7 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
   <nav class="tabs">
     <button class="tab active" data-tab="overview">概览</button>
     <button class="tab" data-tab="models">模型对比</button>
+    <button class="tab" data-tab="insights">深度分析</button>
   </nav>
 
   <!-- ===================== 概览 ===================== -->
@@ -535,7 +541,7 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
         <div class="chart-head"><h2>明细表</h2></div>
         <div class="digest-sub">按来源</div>
         <div class="table-wrap"><table id="sources">
-          <thead><tr><th>来源</th><th>请求数</th><th>Input</th><th>Output</th><th>Cache 读</th><th>Cache 写</th><th>Credits</th></tr></thead>
+          <thead><tr><th>来源</th><th>请求数</th><th>Input</th><th>Output</th><th>Cache 读</th><th>Cache 写</th><th>Credits</th><th>上下文水位</th></tr></thead>
           <tbody></tbody>
         </table></div>
         <div class="digest-sub" style="margin-top:18px">按模型（Top 用量）</div>
@@ -599,15 +605,55 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
       </table>
     </div>
   </div>
+
+  <!-- ===================== 深度分析 ===================== -->
+  <div id="tab-insights" class="tabview hidden">
+    <div class="grid-2col">
+      <div class="panel">
+        <div class="chart-head"><h2>工作节奏 · 按小时（中国时间）</h2></div>
+        <svg id="rhythmSvg" width="100%" height="240"></svg>
+        <div class="digest-sub" style="margin-top:6px">横轴 0–23 点 · 柱高为该小时的 token 总量，悬停查看请求数</div>
+      </div>
+      <div class="panel">
+        <div class="chart-head"><h2>缓存效率趋势</h2></div>
+        <svg id="cacheTrendSvg" width="100%" height="240"></svg>
+        <div class="digest-sub" style="margin-top:6px" id="cacheServedNote"></div>
+      </div>
+    </div>
+    <div class="grid-2col" style="margin-top:26px">
+      <div class="panel">
+        <div class="chart-head"><h2>会话 Top 榜</h2>
+          <select id="sessionLimit" class="select select-sm">
+            <option value="10">Top 10</option>
+            <option value="20" selected>Top 20</option>
+            <option value="50">Top 50</option>
+          </select>
+        </div>
+        <div class="table-wrap"><table id="sessionTable">
+          <thead><tr>
+            <th>来源</th><th>会话</th><th>请求数</th><th>Tokens</th>
+            <th>Credits</th><th>水位</th><th>提问</th><th>工具调用</th><th>跨度</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table></div>
+        <div class="digest-sub" style="margin-top:6px">按 token 总量排序；token 被工具掩码的来源（Qoder）按 credits 参与；标「无计量」的是 BYOK 会话——只有运行日志计数，无任何账单记录；点击会话可展开对话</div>
+      </div>
+      <div class="panel">
+        <div class="chart-head"><h2>上下文水位</h2></div>
+        <svg id="ctxFillSvg" width="100%" height="240"></svg>
+        <div class="digest-sub" style="margin-top:6px" id="ctxFillNote"></div>
+      </div>
+    </div>
+  </div>
 </div>
 </div>
 
-<footer>TokenBuddy v0.3 · 数据来自 Claude / OpenCode / Mimo / Zcode / Pi / Qoder / WorkBuddy 本地日志</footer>
+<footer>TokenBuddy v0.4 · 数据来自 Claude / OpenCode / Mimo / Zcode / Pi / Qoder / WorkBuddy / MiniMax 本地日志</footer>
 
 <script>
-const SRC_COLORS = { claude: '#0071e3', opencode: '#34a853', mimo: '#9a4ddb', zcode: '#e8820c', pi: '#0ea5a0', qoder: '#e0447c', workbuddy: '#5e6ad2' };
-const SRC_NAMES = { claude: 'Claude', opencode: 'OpenCode', mimo: 'Mimo', zcode: 'Zcode', pi: 'Pi', qoder: 'Qoder', workbuddy: 'WorkBuddy' };
-const SRC_KEYS = ['claude', 'opencode', 'mimo', 'zcode', 'pi', 'qoder', 'workbuddy'];
+const SRC_COLORS = { claude: '#0071e3', opencode: '#34a853', mimo: '#9a4ddb', zcode: '#e8820c', pi: '#0ea5a0', qoder: '#e0447c', workbuddy: '#5e6ad2', minimax: '#d93025' };
+const SRC_NAMES = { claude: 'Claude', opencode: 'OpenCode', mimo: 'Mimo', zcode: 'Zcode', pi: 'Pi', qoder: 'Qoder', workbuddy: 'WorkBuddy', minimax: 'MiniMax' };
+const SRC_KEYS = ['claude', 'opencode', 'mimo', 'zcode', 'pi', 'qoder', 'workbuddy', 'minimax'];
 let sortField = 'total_tokens', sortDir = 'desc', modelData = [];
 let sortMField = 'total_tokens', sortMDir = 'desc';
 let modelCompare = { models: [] };
@@ -646,13 +692,14 @@ function filterParams(extra) {
 
 async function loadAll() {
   try {
-    const [sumRes, metRes, modRes, tlRes, hmRes, digRes] = await Promise.all([
+    const [sumRes, metRes, modRes, tlRes, hmRes, digRes, insRes] = await Promise.all([
       fetch('/api/summary?' + filterParams()),
       fetch('/api/metrics?' + filterParams()),
       fetch('/api/models?' + filterParams()),
       fetch('/api/timeline?' + filterParams({ mode: document.getElementById('timelineMode').value })),
       fetch('/api/heatmap?' + filterParams({ mode: document.getElementById('heatmapMode').value, metric: document.getElementById('heatmapMetric').value })),
       fetch('/api/digest?days=' + document.getElementById('digestDays').value),
+      fetch('/api/insights?' + filterParams({ limit: document.getElementById('sessionLimit').value })),
     ]);
     const summary = await sumRes.json();
     const metrics = await metRes.json();
@@ -660,8 +707,9 @@ async function loadAll() {
     const timeline = await tlRes.json();
     const heatmap = await hmRes.json();
     const digest = await digRes.json();
+    const insights = await insRes.json();
 
-    G = { summary, metrics, timeline, heatmap, digest };
+    G = { summary, metrics, timeline, heatmap, digest, insights };
     renderAll();
     document.getElementById('status').textContent =
       `已加载 ${summary.total_requests.toLocaleString()} 条记录`;
@@ -671,7 +719,7 @@ async function loadAll() {
 }
 
 function renderAll() {
-  const { summary, metrics, timeline, heatmap, digest } = G;
+  const { summary, metrics, timeline, heatmap, digest, insights } = G;
   renderDigest(digest);
   renderKpis(summary, metrics.totals);
   renderSourceCards(metrics);
@@ -680,6 +728,7 @@ function renderAll() {
   renderModelComparison(modelCompare);
   renderTimeline(timeline);
   renderHeatmap(heatmap);
+  renderInsights(insights);
 }
 
 /* ---------- 速览（集中指标） ---------- */
@@ -715,17 +764,23 @@ function renderDigest(d) {
     </div>`;
   }).join('') || '<div style="color:var(--faint);font-size:12px">该窗口暂无数据</div>';
 
-  const row = (name, val, pct, color, title) => `
+  const row = (name, val, pct, color, title, valLabel) => `
     <div class="lrow" title="${esc(title)}">
       <div class="name">${esc(name)}</div>
       <div class="share-bar" style="height:9px"><div class="fill" style="width:${(pct * 100).toFixed(1)}%;background:${color}"></div></div>
-      <div class="val">${fmtTokens(val)}</div>
+      <div class="val">${valLabel || fmtTokens(val)}</div>
     </div>`;
-  const maxSrc = Math.max(...(d.by_source || []).map(s => s.tokens), 0.0001);
+  // Masked sources carry no tokens; their credits are the real consumption
+  // unit, so they display (and rank) on credits instead of a flat zero.
+  const srcVal = s => (s.tokens > 0 || !s.credits)
+    ? null
+    : fmtCredits(s.credits) + ' cr';
+  const srcRank = s => s.tokens > 0 ? s.tokens : (s.credits || 0);
+  const maxSrc = Math.max(...(d.by_source || []).map(srcRank), 0.0001);
   document.getElementById('digestSources').innerHTML = (d.by_source || []).slice()
-    .sort((a, b) => b.tokens - a.tokens).map(s =>
-      row(SRC_NAMES[s.source] || s.source, s.tokens, s.tokens / maxSrc, SRC_COLORS[s.source] || '#888',
-        `${s.source}: ${fmtTokens(s.tokens)} tokens · ${fmtReq(s.requests)} 请求`)
+    .sort((a, b) => srcRank(b) - srcRank(a)).map(s =>
+      row(SRC_NAMES[s.source] || s.source, srcRank(s), srcRank(s) / maxSrc, SRC_COLORS[s.source] || '#888',
+        `${s.source}: ${s.tokens > 0 ? fmtTokens(s.tokens) + ' tokens' : fmtCredits(s.credits) + ' credits'} · ${fmtReq(s.requests)} 请求`, srcVal(s))
   ).join('') || '<div style="color:var(--faint);font-size:12px">暂无数据</div>';
 
   const maxMdl = Math.max(...(d.top_models || []).map(m => m.tokens), 0.0001);
@@ -769,6 +824,7 @@ function renderSourceCards(m) {
         <div><span class="k">平均输入</span><span class="v">${fmtNum(s.avg_input_per_req)}</span></div>
         <div><span class="k">平均输出</span><span class="v">${fmtNum(s.avg_output_per_req)}</span></div>
         <div><span class="k">请求数</span><span class="v">${fmtReq(s.requests)}</span></div>
+        ${s.avg_context_ratio != null ? `<div><span class="k">上下文水位</span><span class="v">${fmtPct(s.avg_context_ratio)}</span></div>` : ''}
       </div>
     </div>`;
   }).join('');
@@ -779,7 +835,7 @@ function renderSourceCards(m) {
 function renderSourcesTable(sources) {
   const tbody = document.querySelector('#sources tbody');
   if (!sources || sources.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--faint)">暂无数据</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--faint)">暂无数据</td></tr>';
     return;
   }
   tbody.innerHTML = sources.map(s => `
@@ -791,6 +847,7 @@ function renderSourcesTable(sources) {
     <td>${fmtTokens(s.cache_read_tokens)}</td>
     <td>${fmtTokens(s.cache_creation_tokens)}</td>
     <td>${fmtCredits(s.credits)}</td>
+    <td>${s.avg_context_ratio != null ? fmtPct(s.avg_context_ratio) : '—'}</td>
   </tr>`).join('');
 }
 
@@ -848,7 +905,7 @@ function renderTimeline(buckets) {
   const n = buckets.length;
   const maxTokens = Math.max(...buckets.map(b => b.total_tokens)) || 1;
   const bw = Math.max(2, Math.min(26, width / n - 2));
-  const segs = [['claude_tokens','claude'],['opencode_tokens','opencode'],['mimo_tokens','mimo'],['zcode_tokens','zcode'],['pi_tokens','pi'],['qoder_tokens','qoder'],['workbuddy_tokens','workbuddy']];
+  const segs = [['claude_tokens','claude'],['opencode_tokens','opencode'],['mimo_tokens','mimo'],['zcode_tokens','zcode'],['pi_tokens','pi'],['qoder_tokens','qoder'],['workbuddy_tokens','workbuddy'],['minimax_tokens','minimax']];
 
   let g = `<g transform="translate(${margin.left},${margin.top})">`;
   for (let i = 0; i <= 5; i++) {
@@ -925,6 +982,134 @@ function renderHeatmap(d) {
   html += '</div>';
   if (d.rows.length > rowsLimit) html += `<div style="color:var(--faint);font-size:11px;margin-top:8px">仅显示前 ${rowsLimit} / ${d.rows.length} 个模型</div>`;
   el.innerHTML = html;
+}
+
+/* ---------- 深度分析 ---------- */
+// Compact "3d 4h" style span between two epoch seconds.
+function fmtSpan(a, b) {
+  if (!a || !b || b <= a) return '—';
+  const s = b - a;
+  if (s < 3600) return Math.round(s / 60) + 'm';
+  if (s < 86400) return (s / 3600).toFixed(1) + 'h';
+  return (s / 86400).toFixed(1) + 'd';
+}
+// Draw a simple day-indexed line chart into an svg element. Points carry
+// y in 0..1 plus a title string.
+function drawTrendLine(svgId, pts, fmtVal, yMax) {
+  const svg = document.getElementById(svgId);
+  if (!svg) return;
+  const W = svg.clientWidth || 600, H = 240, m = { l: 44, r: 12, t: 14, b: 34 };
+  const w = W - m.l - m.r, h = H - m.t - m.b;
+  const maxY = Math.max(yMax, ...pts.map(p => p.y)) * 1.15 || 1;
+  if (pts.length === 0) {
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="#86868b" font-size="12">当前过滤范围没有数据</text>`;
+    return;
+  }
+  let g = `<g transform="translate(${m.l},${m.t})">`;
+  for (let i = 0; i <= 4; i++) {
+    const y = h - h * i / 4;
+    g += `<line x1="0" y1="${y}" x2="${w}" y2="${y}" stroke="#ececf0" stroke-width="1"/>`;
+    g += `<text x="-8" y="${y+4}" text-anchor="end" fill="#86868b" font-size="11">${fmtVal(maxY * i / 4)}</text>`;
+  }
+  const x = i => pts.length === 1 ? w / 2 : (i / (pts.length - 1)) * w;
+  const y = v => h - (v / maxY) * h;
+  const path = pts.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p.y).toFixed(1)}`).join('');
+  const area = path + ` L${x(pts.length-1).toFixed(1)},${h} L${x(0).toFixed(1)},${h} Z`;
+  g += `<path d="${area}" fill="rgba(0,113,227,.10)"/>`;
+  g += `<path d="${path}" fill="none" stroke="#0071e3" stroke-width="2" stroke-linejoin="round"/>`;
+  pts.forEach((p, i) => {
+    g += `<circle cx="${x(i).toFixed(1)}" cy="${y(p.y).toFixed(1)}" r="3" fill="#0071e3"><title>${esc(p.title)}</title></circle>`;
+  });
+  const step = Math.ceil(pts.length / 8);
+  pts.forEach((p, i) => {
+    if (i % step !== 0 && i !== pts.length - 1) return;
+    g += `<text x="${x(i).toFixed(1)}" y="${h+18}" text-anchor="middle" fill="#86868b" font-size="10">${esc(p.label)}</text>`;
+  });
+  g += '</g>';
+  svg.innerHTML = g;
+}
+
+function renderInsights(d) {
+  if (!d) return;
+  // --- 工作节奏：24 根柱 ---
+  const svg = document.getElementById('rhythmSvg');
+  if (svg) {
+    const W = svg.clientWidth || 600, H = 240, m = { l: 44, r: 8, t: 14, b: 26 };
+    const w = W - m.l - m.r, h = H - m.t - m.b;
+    const maxT = Math.max(...d.rhythm.map(b => b.tokens)) || 1;
+    let g = `<g transform="translate(${m.l},${m.t})">`;
+    for (let i = 0; i <= 4; i++) {
+      const y = h - h * i / 4;
+      g += `<line x1="0" y1="${y}" x2="${w}" y2="${y}" stroke="#ececf0" stroke-width="1"/>`;
+      g += `<text x="-8" y="${y+4}" text-anchor="end" fill="#86868b" font-size="11">${fmtTokens(maxT * i / 4)}</text>`;
+    }
+    const bw = w / 24 - 3;
+    d.rhythm.forEach((b, i) => {
+      const bh = (b.tokens / maxT) * h;
+      const x = (i / 24) * w + 1.5;
+      const peak = b.tokens === maxT && maxT > 0;
+      g += `<rect x="${x}" y="${h - bh}" width="${Math.max(bw, 2)}" height="${Math.max(bh, b.tokens > 0 ? 2 : 0)}" rx="2.5" fill="${peak ? '#0071e3' : 'rgba(0,113,227,.55)'}"><title>${b.hour}:00–${b.hour}:59\n${fmtTokens(b.tokens)} tokens · ${fmtReq(b.requests)} 请求</title></rect>`;
+      if (i % 3 === 0) g += `<text x="${x + bw/2}" y="${h+16}" text-anchor="middle" fill="#86868b" font-size="10">${b.hour}</text>`;
+    });
+    g += '</g>';
+    svg.innerHTML = g;
+  }
+
+  // --- 缓存效率趋势 ---
+  const cachePts = (d.cache_trend || []).map(c => ({
+    label: c.label.slice(5),
+    y: c.cache_hit_rate || 0,
+    title: `${c.label}\n命中 ${fmtPct(c.cache_hit_rate)} · 缓存读 ${fmtTokens(c.cache_read_tokens)} · 新输入 ${fmtTokens(c.input_tokens)}`,
+  }));
+  drawTrendLine('cacheTrendSvg', cachePts, v => (v * 100).toFixed(0) + '%', 1.0);
+  document.getElementById('cacheServedNote').textContent =
+    d.cache_served_tokens > 0
+      ? `窗口内缓存承接输入 ${fmtTokens(d.cache_served_tokens)} tokens（原始事实，未折算）`
+      : '窗口内没有缓存命中记录';
+
+  // --- 会话 Top 榜 ---
+  const tbody = document.querySelector('#sessionTable tbody');
+  if (tbody) {
+    if (!d.sessions || d.sessions.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--faint)">当前过滤范围没有带会话 id 的记录</td></tr>';
+    } else {
+      tbody.innerHTML = d.sessions.map((s, i) => `
+      <tr>
+        <td>${srcTag(s.source)}${s.from_runtime ? '<span class="nometer-badge" title="BYOK 会话：模型调用直连自己的密钥，Qoder 无任何计量记录，仅有运行日志计数">无计量</span>' : ''}</td>
+        <td><span class="sess-link" data-source="${esc(s.source)}" data-sid="${esc(s.session_id)}" title="点击展开对话">${esc(s.session_id.slice(0, 8))}…</span></td>
+        <td>${fmtReq(s.requests)}</td>
+        <td>${s.total_tokens > 0 ? fmtTokens(s.total_tokens) : '—'}</td>
+        <td>${fmtCredits(s.credits)}</td>
+        <td>${s.avg_context_ratio != null ? fmtPct(s.avg_context_ratio) : '—'}</td>
+        <td>${s.user_prompts != null ? fmtReq(s.user_prompts) : '—'}</td>
+        <td>${s.tool_calls != null ? fmtReq(s.tool_calls) : '—'}</td>
+        <td>${fmtSpan(s.first_ts, s.last_ts)}</td>
+      </tr>`).join('');
+      tbody.querySelectorAll('.sess-link').forEach(el => el.addEventListener('click', () => {
+        const wrapId = 'sess-detail-' + el.dataset.sid.slice(0, 8);
+        let wrap = document.getElementById(wrapId);
+        if (wrap) { wrap.remove(); return; }
+        wrap = document.createElement('div');
+        wrap.id = wrapId;
+        wrap.className = 'ctx-session';
+        wrap.style.cssText = 'padding:10px 14px';
+        el.closest('tr').after(wrap);
+        wrap.innerHTML = '<div class="digest-sub">载入对话…</div>';
+        loadSessionInto(wrap, el.dataset.source, el.dataset.sid, null, 12);
+      }));
+    }
+  }
+
+  // --- 上下文水位 ---
+  const fillPts = (d.context_fill_trend || []).map(c => ({
+    label: c.label.slice(5),
+    y: c.avg_ratio || 0,
+    title: `${c.label}\n平均水位 ${fmtPct(c.avg_ratio)} · ${fmtReq(c.requests)} 个上报请求`,
+  }));
+  drawTrendLine('ctxFillSvg', fillPts, v => (v * 100).toFixed(0) + '%', 1.0);
+  document.getElementById('ctxFillNote').textContent = d.context_fill_avg != null
+    ? `窗口平均 ${fmtPct(d.context_fill_avg)}（来源上报的上下文窗口占比；当前仅 Qoder 提供）`
+    : '当前过滤范围内没有上报上下文水位的请求（该指标来自 Qoder）';
 }
 
 /* ---------- 模型对比 ---------- */
@@ -1834,6 +2019,10 @@ document.getElementById('timelineMode').addEventListener('change', async () => {
 });
 document.getElementById('heatmapMode').addEventListener('change', reloadHeatmap);
 document.getElementById('heatmapMetric').addEventListener('change', reloadHeatmap);
+document.getElementById('sessionLimit').addEventListener('change', async () => {
+  const res = await fetch('/api/insights?' + filterParams({ limit: document.getElementById('sessionLimit').value }));
+  renderInsights(await res.json());
+});
 document.getElementById('digestDays').addEventListener('change', async () => {
   const res = await fetch('/api/digest?days=' + document.getElementById('digestDays').value);
   renderDigest(await res.json());

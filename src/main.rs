@@ -1,9 +1,9 @@
 use anyhow::Result;
-use tokenbuddy::context::{self, ContextHandle};
-use tokenbuddy::store::{Store, TimelineMode};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tiny_http::{Header, Response, Server};
+use tokenbuddy::context::{self, ContextHandle};
+use tokenbuddy::store::{Store, TimelineMode};
 
 const HTML: &str = include_str!("dashboard.html");
 
@@ -12,9 +12,10 @@ const HTML: &str = include_str!("dashboard.html");
 type JsonResponse = Response<std::io::Cursor<Vec<u8>>>;
 
 fn json_response(body: String) -> JsonResponse {
-    Response::from_string(body)
-        .with_header(Header::from_bytes("Content-Type", "application/json")
-            .expect("hardcoded header should be valid"))
+    Response::from_string(body).with_header(
+        Header::from_bytes("Content-Type", "application/json")
+            .expect("hardcoded header should be valid"),
+    )
 }
 
 /// Errors go through serde rather than `format!` — DuckDB and IO messages
@@ -24,8 +25,10 @@ fn json_response(body: String) -> JsonResponse {
 fn error_response(e: &anyhow::Error) -> JsonResponse {
     let body = serde_json::json!({ "error": e.to_string() }).to_string();
     Response::from_string(body)
-        .with_header(Header::from_bytes("Content-Type", "application/json")
-            .expect("hardcoded header should be valid"))
+        .with_header(
+            Header::from_bytes("Content-Type", "application/json")
+                .expect("hardcoded header should be valid"),
+        )
         .with_status_code(500)
 }
 
@@ -95,7 +98,8 @@ fn hex_val(c: u8) -> Option<u8> {
 
 fn main() -> Result<()> {
     let store = Arc::new(Store::open()?);
-    let server = Server::http("127.0.0.1:8080").map_err(|e| anyhow::anyhow!("Failed to start server: {}", e))?;
+    let server = Server::http("127.0.0.1:8080")
+        .map_err(|e| anyhow::anyhow!("Failed to start server: {}", e))?;
 
     // Context index lives next to the token parquet. The first build runs in
     // the background so the dashboard is up immediately; until it lands the
@@ -122,13 +126,17 @@ fn main() -> Result<()> {
         let response: JsonResponse = match (method.as_str(), url) {
             ("GET", "/") => {
                 Response::from_string(HTML)
-                    .with_header(Header::from_bytes("Content-Type", "text/html")
-                        .expect("hardcoded header should be valid"))
+                    .with_header(
+                        Header::from_bytes("Content-Type", "text/html")
+                            .expect("hardcoded header should be valid"),
+                    )
                     // The page is rebuilt into the binary on every change;
                     // without this the browser serves a stale page and the
                     // change "does not land".
-                    .with_header(Header::from_bytes("Cache-Control", "no-cache")
-                        .expect("hardcoded header should be valid"))
+                    .with_header(
+                        Header::from_bytes("Cache-Control", "no-cache")
+                            .expect("hardcoded header should be valid"),
+                    )
             }
             ("GET", path) if path.starts_with("/api/summary") => {
                 match handle_summary(&store, path) {
@@ -181,18 +189,20 @@ fn main() -> Result<()> {
                     Err(e) => error_response(&e),
                 }
             }
-            ("GET", path) if path.starts_with("/api/models") => {
-                match handle_models(&store, path) {
+            ("GET", path) if path.starts_with("/api/insights") => {
+                match handle_insights(&store, path) {
                     Ok(json) => json_response(json),
                     Err(e) => error_response(&e),
                 }
             }
-            ("GET", path) if path.starts_with("/api/digest") => {
-                match handle_digest(&store, path) {
-                    Ok(json) => json_response(json),
-                    Err(e) => error_response(&e),
-                }
-            }
+            ("GET", path) if path.starts_with("/api/models") => match handle_models(&store, path) {
+                Ok(json) => json_response(json),
+                Err(e) => error_response(&e),
+            },
+            ("GET", path) if path.starts_with("/api/digest") => match handle_digest(&store, path) {
+                Ok(json) => json_response(json),
+                Err(e) => error_response(&e),
+            },
             ("GET", path) if path.starts_with("/api/context/search") => {
                 match handle_context_search(&context, path) {
                     Ok(json) => json_response(json),
@@ -287,7 +297,12 @@ fn filters_from(path: &str) -> Filters {
 
 fn handle_summary(store: &Store, path: &str) -> Result<String> {
     let f = filters_from(path);
-    let summary = store.query_summary(f.source.as_deref(), f.model.as_deref(), f.date_start, f.date_end)?;
+    let summary = store.query_summary(
+        f.source.as_deref(),
+        f.model.as_deref(),
+        f.date_start,
+        f.date_end,
+    )?;
     Ok(serde_json::to_string(&summary)?)
 }
 
@@ -359,7 +374,10 @@ fn handle_context_session(context: &ContextHandle, path: &str) -> Result<String>
         "source 与 session_id 必填"
     );
     Ok(serde_json::to_string(&context.session_view(
-        &source, &session_id, doc_id, around,
+        &source,
+        &session_id,
+        doc_id,
+        around,
     )?)?)
 }
 
@@ -375,20 +393,56 @@ fn handle_context_stats(context: &ContextHandle) -> Result<String> {
 
 fn handle_metrics(store: &Store, path: &str) -> Result<String> {
     let f = filters_from(path);
-    let metrics = store.query_metrics(f.source.as_deref(), f.model.as_deref(), f.date_start, f.date_end)?;
+    let metrics = store.query_metrics(
+        f.source.as_deref(),
+        f.model.as_deref(),
+        f.date_start,
+        f.date_end,
+    )?;
     Ok(serde_json::to_string(&metrics)?)
+}
+
+/// `GET /api/insights?timeRange=&source=&model=&limit=` — the deep-analysis
+/// panels (hour-of-day rhythm, daily cache efficiency, session leaderboard,
+/// context fill trend) in one call.
+fn handle_insights(store: &Store, path: &str) -> Result<String> {
+    let f = filters_from(path);
+    let limit = parse_params(path)
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .filter(|l| (1..=100).contains(l))
+        .unwrap_or(20);
+    let insights = store.query_insights(
+        f.source.as_deref(),
+        f.model.as_deref(),
+        f.date_start,
+        f.date_end,
+        limit,
+    )?;
+    Ok(serde_json::to_string(&insights)?)
 }
 
 fn handle_models(store: &Store, path: &str) -> Result<String> {
     let f = filters_from(path);
-    let comparison = store.query_models(f.source.as_deref(), f.model.as_deref(), f.date_start, f.date_end)?;
+    let comparison = store.query_models(
+        f.source.as_deref(),
+        f.model.as_deref(),
+        f.date_start,
+        f.date_end,
+    )?;
     Ok(serde_json::to_string(&comparison)?)
 }
 
 fn handle_heatmap(store: &Store, path: &str) -> Result<String> {
     let params = parse_params(path);
-    let mode = params.get("mode").map(|s| s.as_str()).unwrap_or("model_x_source");
-    let metric = params.get("metric").map(|s| s.as_str()).unwrap_or("total_tokens");
+    let mode = params
+        .get("mode")
+        .map(|s| s.as_str())
+        .unwrap_or("model_x_source");
+    let metric = params
+        .get("metric")
+        .map(|s| s.as_str())
+        .unwrap_or("total_tokens");
     let f = filters_from(path);
 
     let heatmap = store.query_heatmap(
@@ -416,7 +470,13 @@ fn handle_timeline(store: &Store, path: &str) -> Result<String> {
     // numbers while every other one narrowed.
     let f = filters_from(path);
 
-    let timeline = store.query_timeline(mode, f.source.as_deref(), f.model.as_deref(), f.date_start, f.date_end)?;
+    let timeline = store.query_timeline(
+        mode,
+        f.source.as_deref(),
+        f.model.as_deref(),
+        f.date_start,
+        f.date_end,
+    )?;
     Ok(serde_json::to_string(&timeline)?)
 }
 
@@ -452,7 +512,8 @@ fn handle_digest(store: &Store, path: &str) -> Result<String> {
 
     let cur = store.query_summary(None, None, Some(cur_start), Some(now))?;
     let prev = store.query_summary(None, None, Some(prev_start), Some(cur_start))?;
-    let daily = store.query_timeline(TimelineMode::Daily, None, None, Some(cur_start), Some(now))?;
+    let daily =
+        store.query_timeline(TimelineMode::Daily, None, None, Some(cur_start), Some(now))?;
 
     let cache_hit = |s: &tokenbuddy::store::Summary| {
         let input_side = s.total_input_tokens + s.total_cache_read_tokens;
@@ -480,9 +541,8 @@ fn handle_digest(store: &Store, path: &str) -> Result<String> {
         }
     };
 
-    let mut top_models: Vec<&tokenbuddy::store::ModelRow> =
-        cur.by_model.iter().collect();
-    top_models.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    let mut top_models: Vec<&tokenbuddy::store::ModelRow> = cur.by_model.iter().collect();
+    top_models.sort_by_key(|m| std::cmp::Reverse(m.total_tokens));
     let top_models: Vec<serde_json::Value> = top_models
         .into_iter()
         .take(6)
@@ -503,6 +563,9 @@ fn handle_digest(store: &Store, path: &str) -> Result<String> {
                 "source": s.source,
                 "tokens": s.input_tokens + s.output_tokens + s.cache_read_tokens + s.cache_creation_tokens,
                 "requests": s.requests,
+                // Masked sources (Qoder tokens are server-zeroed) would rank on
+                // 0 forever; credits are their real consumption unit.
+                "credits": s.credits,
             })
         })
         .collect();
@@ -545,7 +608,10 @@ mod tests {
     #[test]
     fn decodes_the_model_names_the_dashboard_sends() {
         // URLSearchParams encodes '/' as %2F, '+' as %2B and a space as '+'.
-        assert_eq!(percent_decode("Qwen%2FQwen3-Coder-480B"), "Qwen/Qwen3-Coder-480B");
+        assert_eq!(
+            percent_decode("Qwen%2FQwen3-Coder-480B"),
+            "Qwen/Qwen3-Coder-480B"
+        );
         assert_eq!(percent_decode("claude-x%2Bgpt-y"), "claude-x+gpt-y");
         assert_eq!(percent_decode("gpt-5+mini"), "gpt-5 mini");
         assert_eq!(percent_decode("claude-sonnet-4-5"), "claude-sonnet-4-5");
@@ -564,7 +630,10 @@ mod tests {
     fn params_are_decoded_and_split_on_the_first_equals_only() {
         let p = parse_params("/api/models?timeRange=30d&model=Qwen%2FQwen3-Coder-480B&source=all");
         assert_eq!(p.get("timeRange").map(String::as_str), Some("30d"));
-        assert_eq!(p.get("model").map(String::as_str), Some("Qwen/Qwen3-Coder-480B"));
+        assert_eq!(
+            p.get("model").map(String::as_str),
+            Some("Qwen/Qwen3-Coder-480B")
+        );
         assert_eq!(p.get("source").map(String::as_str), Some("all"));
         assert!(parse_params("/api/models").is_empty());
     }
@@ -584,7 +653,10 @@ mod tests {
             // requested number of whole days plus however much of today has
             // elapsed — never a full extra day.
             assert!(now - cur_start >= days * 86_400, "{days}d window too short");
-            assert!(now - cur_start < (days + 1) * 86_400, "{days}d window too long");
+            assert!(
+                now - cur_start < (days + 1) * 86_400,
+                "{days}d window too long"
+            );
         }
     }
 }

@@ -61,6 +61,13 @@ TokenBuddy 在本地回答以上全部问题，只需要一个二进制。
 上期速览、来源对比、模型热力图（模型 × 来源、模型 × 日期）。所有时间分桶固定
 UTC+8——没有夏令时的坑。
 
+### 🧠 深度分析：看清你的真实工作节奏
+
+同一份 parquet 之上的一个附加标签页：按小时的工作节奏直方图、逐日缓存效率
+趋势（附缓存承接的原始 token 量）、会话 Top 榜（点击直达完整对话）、以及
+上下文水位趋势（来自会上报该指标的来源——Qoder 的 `context_usage_ratio`，
+是它遮蔽 Token 后唯一存活的 token 尺度信号）。全部是原始事实，零推算。
+
 ### 🔍 一台对话时光机：搜到你说过的每一句话
 
 这是用过就回不去的功能。纯 Rust 倒排索引，只索引 user/assistant 对话轮——
@@ -101,16 +108,41 @@ TokenBuddy 攒下的语料是机器可读的，装好
 |---|---|---|
 | Claude Code | `claude` | 读取本地 JSONL 会话日志 |
 | ZCode | `zcode` | |
-| Qoder | `qoder` | 宿主遮蔽 Token 数，按上报点数（credits）计量 |
+| Qoder | `qoder` | 宿主遮蔽 Token 数，按上报点数（credits）+ 上报的上下文窗口水位计量 |
 | WorkBuddy | `workbuddy` | |
+| MiniMax Code | `minimax` | 读取 `~/.minimax/v2/sessions/**/messages.jsonl` |
 | OpenCode | `opencode` | |
 | Mimo | `mimo` | |
 | Pi | `pi` | |
 
 ## 快速开始
 
-**Apple Silicon 直接下载**：到 [Releases](../../releases) 取
-`tokenbuddy-v0.4.0-aarch64-apple-darwin.tar.gz`，解压即跑。
+**Apple Silicon / Linux x64** —— 一键安装脚本（macOS 推荐，原因见下方
+Gatekeeper 说明）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/walker83/TokenBuddy/main/scripts/install.sh | bash
+tokenbuddy
+```
+
+或到 [Releases](../../releases) 取
+`tokenbuddy-v0.4.1-aarch64-apple-darwin.tar.gz`，解压即跑。
+
+### macOS 提示"无法打开 / 不安全"？
+
+发布二进制是 ad-hoc 签名——没有付费的 Apple 开发者账号就无法公证，
+而**通过浏览器下载**的压缩包会带 quarantine 隔离属性，Gatekeeper 因此拦截。
+两种解决：
+
+```bash
+# a) 解压后移除隔离属性
+xattr -d com.apple.quarantine ./tokenbuddy
+
+# b) 或直接用安装脚本：curl 下载不会附加隔离属性，天然绕开该问题
+curl -fsSL https://raw.githubusercontent.com/walker83/TokenBuddy/main/scripts/install.sh | bash
+```
+
+正式的 Developer ID 签名 + 公证已列入 Roadmap（需要 Apple 开发者账号）。
 
 **其他平台从源码构建**（需要 Rust 1.75+，全程约 48 秒）：
 
@@ -177,6 +209,7 @@ HTTP API 天然只监听本地；没有可泄密的配置、没有账号、没�
 | GET | `/api/heatmap?mode=model_x_source\|model_x_date&metric=` | 热力图矩阵 |
 | GET | `/api/models` | 模型对比表 |
 | GET | `/api/digest?days=7` | 本期 vs 上期、Top 模型、来源拆分 |
+| GET | `/api/insights?limit=20` | 深度分析：分时节奏、缓存趋势、会话 Top、上下文水位 |
 | GET | `/api/context/search?q=&source=&role=&project=&days=&limit=` | 全文搜索 |
 | GET | `/api/context/session?source=&session_id=&doc_id=&around=` | 命中处的上下文会话 |
 | GET | `/api/context/stats` | 索引构建状态 + 语料规模 |
@@ -202,6 +235,7 @@ cargo test --release
 ## Roadmap
 
 - [ ] `cargo install` / Homebrew 打包
+- [ ] Developer ID 签名 + 公证（需 Apple 开发者账号）
 - [ ] CI 发布：Linux / Intel macOS 预编译二进制
 - [ ] 界面英文切换（当前中文优先）
 - [ ] 更多工具：Cursor、Copilot CLI、Windsurf、Gemini CLI……

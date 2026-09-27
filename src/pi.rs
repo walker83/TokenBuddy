@@ -5,7 +5,7 @@
 //! assistant turn is a `type: "message"` record whose `message` object holds
 //! `model` and `usage` with input / output / cacheRead / cacheWrite token counts.
 
-use crate::{file_mtime, Source, TokenRecord};
+use crate::{file_mtime, FileCacheMap, Source, TokenRecord};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-static FILE_CACHE: Mutex<Option<HashMap<String, (SystemTime, Vec<TokenRecord>)>>> = Mutex::new(None);
+static FILE_CACHE: Mutex<Option<FileCacheMap>> = Mutex::new(None);
 
 pub fn collect_records() -> Result<Vec<TokenRecord>> {
     let sessions_dir = get_pi_dir().join("agent").join("sessions");
@@ -117,7 +117,10 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
         };
 
         if session_id.is_none() && value.get("type").and_then(|t| t.as_str()) == Some("session") {
-            session_id = value.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            session_id = value
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
         }
 
         if value.get("type").and_then(|t| t.as_str()) != Some("message") {
@@ -164,12 +167,16 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
             input_tokens: usage.get("input").and_then(|v| v.as_u64()).unwrap_or(0),
             output_tokens,
             cache_read_tokens: usage.get("cacheRead").and_then(|v| v.as_u64()).unwrap_or(0),
-            cache_creation_tokens: usage.get("cacheWrite").and_then(|v| v.as_u64()).unwrap_or(0),
+            cache_creation_tokens: usage
+                .get("cacheWrite")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
             timestamp,
             session_id: session_id.clone(),
             duration_ms: None,
             ttft_ms: None,
             credits: 0.0,
+            context_ratio: 0.0,
             record_id: None,
         });
     }
@@ -203,9 +210,13 @@ pub fn drain_messages(sink: &mut dyn FnMut(crate::context::ContextMessage)) {
             .to_string();
         for line_result in BufReader::new(file).lines() {
             let Ok(line) = line_result else { continue };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
 
-            if session_id.is_empty() && value.get("type").and_then(|t| t.as_str()) == Some("session") {
+            if session_id.is_empty()
+                && value.get("type").and_then(|t| t.as_str()) == Some("session")
+            {
                 session_id = value
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -215,7 +226,9 @@ pub fn drain_messages(sink: &mut dyn FnMut(crate::context::ContextMessage)) {
             if value.get("type").and_then(|t| t.as_str()) != Some("message") {
                 continue;
             }
-            let Some(message) = value.get("message") else { continue };
+            let Some(message) = value.get("message") else {
+                continue;
+            };
             let role = match message.get("role").and_then(|r| r.as_str()) {
                 Some("user") => "user",
                 Some("assistant") => "assistant",
@@ -260,7 +273,6 @@ pub fn drain_messages(sink: &mut dyn FnMut(crate::context::ContextMessage)) {
 // sources. Calls whose result never arrives are not stored by pi, so there is
 // no input fallback here by design.
 // ============================================================
-
 
 /// Collect into a vector; the sync path uses [`drain_messages`] so a source's
 /// messages are absorbed one at a time instead of all living at once.

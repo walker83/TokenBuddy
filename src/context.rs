@@ -24,7 +24,7 @@
 //! sync; the parquet file is the durable state, so a restart just re-reads
 //! it.
 
-use crate::{claude, mimo, opencode, pi, qoder, workbuddy, zcode, Source};
+use crate::{claude, mimo, minimax, opencode, pi, qoder, workbuddy, zcode, Source};
 use anyhow::Result;
 use arrow::array::{
     Array, BooleanArray, BooleanBuilder, Int64Array, Int64Builder, RecordBatch, StringBuilder,
@@ -35,7 +35,7 @@ use parquet::arrow::ProjectionMask;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 /// Per-doc text kept in RAM and searched. Conversational messages rarely
@@ -219,6 +219,19 @@ pub fn doc_id_of(source: &str, session_id: &str, normalized: &str) -> i64 {
 // Collection
 // ============================================================
 
+/// True if `name` is a table or view in the connected database.
+/// Cheap one-row probe against sqlite_master — used to pick between
+/// OpenCode's v1 (`message`/`part`) and v2 (`session_message`) schemas
+/// without a per-version dependency. Shared between the token collector
+/// (`opencode.rs`) and this context search collector.
+pub(crate) fn sqlite_table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
+    let mut stmt = match conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ?1 LIMIT 1") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    stmt.exists(rusqlite::params![name]).unwrap_or(false)
+}
+
 /// zcode / opencode / mimo share the opencode lineage schema: `message` rows
 /// carry role + visibility in a JSON `data` column, `part` rows carry the
 /// text under `type: "text"`. Hidden messages (background notifications) are
@@ -235,19 +248,61 @@ fn drain_lineage(source: Source, db_path: &std::path::Path, sink: &mut dyn FnMut
             // `session.directory` is the real working directory and
             // `session.title` the display name — together they answer "which
             // project was this in" and "which conversation is this".
-            let conn = rusqlite::Connection::open(&db_path)?;
-            let mut stmt = conn.prepare(
-                "SELECT m.session_id, m.time_created,
-                        json_extract(m.data, '$.role'),
-                        json_extract(p.data, '$.text'),
-                        s.directory,
-                        s.title
-                 FROM part p
-                 JOIN message m ON m.id = p.message_id
-                 JOIN session s ON s.id = m.session_id
-                 WHERE json_extract(p.data, '$.type') = 'text'
-                   AND COALESCE(json_extract(m.data, '$.semantics.uiVisibility'), 'visible') != 'hidden'",
-            )?;
+            let conn = rusqlite::Connection::open(db_path)?;
+
+            // OpenCode shipped two SQLite shapes. v1 has `part` rows
+            // carrying text bodies and `session` for metadata. v2 (>= 2026)
+            // drops both: message bodies are flattened into
+            // `session_message.data.content[]` as `{type:"text", text:"..."}`
+            // entries, and `session` became `session_v2`. Detect at runtime
+            // so both stay supported. See PR feat/opencode-v2-on-gitea.
+            // `session.directory` is the real working directory and
+            // `session.title` the display name — together they answer "which
+            // project was this in" and "which conversation is this".
+            let sql = if crate::context::sqlite_table_exists(&conn, "part") {
+                // v1: text lives on `part`, joined to `message` and `session`.
+                "SELECT m.session_id, m.time_created, \
+                        json_extract(m.data, '$.role'), \
+                        json_extract(p.data, '$.text'), \
+                        s.directory, \
+                        s.title \
+                 FROM part p \
+                 JOIN message m ON m.id = p.message_id \
+                 JOIN session s ON s.id = m.session_id \
+                 WHERE json_extract(p.data, '$.type') = 'text' \
+                   AND COALESCE(json_extract(m.data, '$.semantics.uiVisibility'), 'visible') != 'hidden'"
+            } else if crate::context::sqlite_table_exists(&conn, "session_message") {
+                // v2: text comes from one of two places per row type:
+                //   - user messages: `data.text` is the prompt string directly.
+                //   - assistant messages: `data.content[]` is an array of
+                //     {type, text} parts where `type='text'` is the visible
+                //     reply. Reasoning and tool parts are skipped to keep
+                //     the search corpus the human-visible conversation.
+                // `json_each` flattens the content array so we can pick the
+                // text parts with a regular WHERE clause. Hidden-row
+                // filtering is omitted because v2 doesn't expose a
+                // uiVisibility field.
+                "SELECT m.session_id, s.time_created, \
+                        m.type, \
+                        COALESCE( \
+                            json_extract(m.data, '$.text'), \
+                            json_extract(je.value, '$.text')), \
+                        s.directory, \
+                        s.title \
+                 FROM session_message m \
+                 JOIN session_v2 s ON s.id = m.session_id, \
+                      json_each(m.data, '$.content') je \
+                 WHERE ( \
+                       (m.type = 'user' AND json_extract(m.data, '$.text') IS NOT NULL) \
+                    OR (m.type = 'assistant' \
+                        AND json_extract(je.value, '$.type') = 'text' \
+                        AND json_extract(je.value, '$.text') IS NOT NULL) \
+                 )"
+            } else {
+                // Neither schema present — nothing to extract from this source.
+                return Ok(());
+            };
+            let mut stmt = conn.prepare(sql)?;
             let rows = stmt.query_map([], |row| {
                 let session_id: String = row.get::<_, Option<String>>(0)?.unwrap_or_default();
                 let created_ms: Option<i64> = row.get(1)?;
@@ -255,7 +310,14 @@ fn drain_lineage(source: Source, db_path: &std::path::Path, sink: &mut dyn FnMut
                 let text: Option<String> = row.get(3)?;
                 let project: Option<String> = row.get(4)?;
                 let title: Option<String> = row.get(5)?;
-                Ok((session_id, created_ms.unwrap_or(0), role, text, project, title))
+                Ok((
+                    session_id,
+                    created_ms.unwrap_or(0),
+                    role,
+                    text,
+                    project,
+                    title,
+                ))
             })?;
             for row in rows {
                 let (session_id, created_ms, role, text, project, title) = row?;
@@ -281,7 +343,10 @@ fn drain_lineage(source: Source, db_path: &std::path::Path, sink: &mut dyn FnMut
             Ok(())
         })();
         if let Err(e) = ok {
-            eprintln!("[TokenBuddy] context: {} extraction failed: {e}", source.as_str());
+            eprintln!(
+                "[TokenBuddy] context: {} extraction failed: {e}",
+                source.as_str()
+            );
         }
     }
 }
@@ -330,17 +395,20 @@ fn docs_to_batch(docs: &[(i64, ContextMessage, bool)]) -> RecordBatch {
         trunc_b.append_value(*truncated);
     }
 
-    RecordBatch::try_new(schema, vec![
-        Arc::new(id_b.finish()) as Arc<dyn Array>,
-        Arc::new(src_b.finish()),
-        Arc::new(sid_b.finish()),
-        Arc::new(role_b.finish()),
-        Arc::new(ts_b.finish()),
-        Arc::new(text_b.finish()),
-        Arc::new(proj_b.finish()),
-        Arc::new(title_b.finish()),
-        Arc::new(trunc_b.finish()),
-    ])
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(id_b.finish()) as Arc<dyn Array>,
+            Arc::new(src_b.finish()),
+            Arc::new(sid_b.finish()),
+            Arc::new(role_b.finish()),
+            Arc::new(ts_b.finish()),
+            Arc::new(text_b.finish()),
+            Arc::new(proj_b.finish()),
+            Arc::new(title_b.finish()),
+            Arc::new(trunc_b.finish()),
+        ],
+    )
     .expect("context record batch construction")
 }
 
@@ -370,10 +438,14 @@ fn read_existing_doc_ids(path: &Path) -> Result<HashSet<i64>> {
     Ok(ids)
 }
 
+/// Test-only writer: production sync streams through `SyncSink` instead, but
+/// the golden-set tests build an arbitrary parquet in one shot.
+#[cfg(test)]
 fn write_context_parquet(path: &Path, batch: &RecordBatch) -> Result<()> {
     let tmp = path.with_extension("parquet.tmp");
     let file = std::fs::File::create(&tmp)?;
-    let mut writer = parquet::arrow::arrow_writer::ArrowWriter::try_new(file, batch.schema(), None)?;
+    let mut writer =
+        parquet::arrow::arrow_writer::ArrowWriter::try_new(file, batch.schema(), None)?;
     writer.write(batch)?;
     writer.close()?;
     std::fs::rename(tmp, path)?;
@@ -414,6 +486,7 @@ pub fn sync_context(path: &Path, clear: bool) -> Result<SyncStats> {
         pi::drain_messages(&mut push);
         qoder::drain_messages(&mut push);
         workbuddy::drain_messages(&mut push);
+        minimax::drain_messages(&mut push);
     }
     sink.finish(path)
 }
@@ -454,7 +527,8 @@ impl SyncSink {
         if !self.existing.insert(id) {
             return;
         }
-        self.new_docs.push((id, ContextMessage { text, ..m }, truncated));
+        self.new_docs
+            .push((id, ContextMessage { text, ..m }, truncated));
     }
 
     fn finish(self, path: &Path) -> Result<SyncStats> {
@@ -674,6 +748,7 @@ fn is_token_char(ch: char) -> bool {
 ///   "上下文搜索" finds its docs, word boundaries and jieba's 55 MB
 ///   dictionary alike. Substring verification at query time is the
 ///   precision layer, so nothing needs a word tier.
+///
 /// Everything else is a separator; query and target split identically.
 pub fn grams_of(text: &str) -> (Vec<String>, Vec<String>) {
     let mut tokens = Vec::new();
@@ -866,6 +941,7 @@ impl IndexBuilder {
     /// handed in by the caller (`cursors` advance per term), original-case
     /// text compressed into its arena. `idx` must equal the doc's final
     /// position, i.e. docs arrive in the same order pass 1 saw them.
+    #[allow(clippy::too_many_arguments)] // private two-pass builder, callers all in this file
     fn push_doc(
         &mut self,
         doc_id: i64,
@@ -921,6 +997,7 @@ impl IndexBuilder {
     /// Finalize into the compact `ContextIndex`: each term's bucket interval
     /// sorts ascending, delta-varint-encodes into the posting arena, and
     /// records its `Span`; the bucket arena drops on return.
+    #[allow(clippy::too_many_arguments)] // private finalize step, single call site
     fn finish(
         self,
         mut buckets: Vec<u32>,
@@ -935,12 +1012,19 @@ impl IndexBuilder {
         let n_terms = self.counts.len();
         let mut postings: Vec<u8> = Vec::new();
         let mut ascii: BTreeMap<Box<str>, Span> = BTreeMap::new();
-        let mut cjk: HashMap<Box<str>, Span> = HashMap::with_capacity(n_terms - self.ascii_ids.len());
+        let mut cjk: HashMap<Box<str>, Span> =
+            HashMap::with_capacity(n_terms - self.ascii_ids.len());
         for (term, &tid) in &self.terms {
-            let (off, len) = (offsets[tid as usize] as usize, self.counts[tid as usize] as usize);
+            let (off, len) = (
+                offsets[tid as usize] as usize,
+                self.counts[tid as usize] as usize,
+            );
             let interval = &mut buckets[off..off + len];
             interval.sort_unstable();
-            let span = Span { off: postings.len() as u32, len: len as u32 };
+            let span = Span {
+                off: postings.len() as u32,
+                len: len as u32,
+            };
             encode_deltas(interval, &mut postings);
             if self.ascii_ids.contains(&tid) {
                 ascii.insert(term.clone(), span);
@@ -949,11 +1033,7 @@ impl IndexBuilder {
             }
         }
 
-        let mut df_hist: Vec<u32> = ascii
-            .values()
-            .chain(cjk.values())
-            .map(|s| s.len)
-            .collect();
+        let mut df_hist: Vec<u32> = ascii.values().chain(cjk.values()).map(|s| s.len).collect();
         df_hist.sort_unstable();
 
         // Live-bytes estimate of everything the index holds at rest.
@@ -962,7 +1042,8 @@ impl IndexBuilder {
         let approx_bytes = postings.len()
             + self.text_arena.len()
             + self.text_spans.len() * std::mem::size_of::<Span>()
-            + (ascii.len() + cjk.len()) * (std::mem::size_of::<Span>() + 3 * std::mem::size_of::<usize>())
+            + (ascii.len() + cjk.len())
+                * (std::mem::size_of::<Span>() + 3 * std::mem::size_of::<usize>())
             + ascii_key_bytes
             + cjk_key_bytes
             + self.docs.len() * std::mem::size_of::<DocMeta>()
@@ -1055,7 +1136,11 @@ impl ContextIndex {
                     let session = b.intern_session(sids.value(i));
                     let project_id =
                         b.intern_project(projects_col.map(|c| c.value(i)).unwrap_or(""));
-                    let role = if roles.value(i) == "user" { ROLE_USER } else { ROLE_ASSISTANT };
+                    let role = if roles.value(i) == "user" {
+                        ROLE_USER
+                    } else {
+                        ROLE_ASSISTANT
+                    };
                     let ts = tss.value(i);
                     let title = titles_col.map(|c| c.value(i)).unwrap_or("");
                     if !title.is_empty() {
@@ -1068,9 +1153,12 @@ impl ContextIndex {
                     }
                     b.count_doc(&text);
                     let key = (source, session);
-                    let e = sess_stat
-                        .entry(key)
-                        .or_insert((0usize, 0i64, role == ROLE_USER, project_id));
+                    let e = sess_stat.entry(key).or_insert((
+                        0usize,
+                        0i64,
+                        role == ROLE_USER,
+                        project_id,
+                    ));
                     e.0 += 1;
                     if ts > e.1 {
                         e.1 = ts;
@@ -1096,7 +1184,9 @@ impl ContextIndex {
             .collect();
         let mut digests: Vec<(i64, i64, u8, u32, u32, String)> = Vec::new();
         for ((source, session), count, max_ts, project_id) in digest_inputs {
-            let Some(preview) = b.first_user.get(&(source, session)) else { continue };
+            let Some(preview) = b.first_user.get(&(source, session)) else {
+                continue;
+            };
             let mut digest = String::from(preview.as_ref());
             digest.push_str(&format!("\n消息: {count}"));
             let doc_id = doc_id_of(
@@ -1156,9 +1246,12 @@ impl ContextIndex {
                     let (text, _) = truncate_chars(texts_col.value(i), MAX_DOC_CHARS);
                     let source = b.source_ids[sources.value(i)];
                     let session = b.session_ids[sids.value(i)];
-                    let project_id =
-                        b.project_ids[projects_col.map(|c| c.value(i)).unwrap_or("")];
-                    let role = if roles.value(i) == "user" { ROLE_USER } else { ROLE_ASSISTANT };
+                    let project_id = b.project_ids[projects_col.map(|c| c.value(i)).unwrap_or("")];
+                    let role = if roles.value(i) == "user" {
+                        ROLE_USER
+                    } else {
+                        ROLE_ASSISTANT
+                    };
                     b.push_doc(
                         ids.value(i),
                         tss.value(i),
@@ -1248,10 +1341,7 @@ impl ContextIndex {
 
     /// Decode one posting list from the delta-varint arena.
     fn decode_postings(&self, span: Span) -> Vec<u32> {
-        decode_deltas(
-            &self.postings[span.off as usize..],
-            span.len,
-        )
+        decode_deltas(&self.postings[span.off as usize..], span.len)
     }
 
     /// Decompress one doc's original-case text from the arena. A zstd frame
@@ -1283,8 +1373,14 @@ impl ContextIndex {
         const VIEW_MSG_CHARS: usize = 1500;
         let around = around.clamp(1, 50);
         // Interned ids make the filter integer comparisons.
-        let src_id = self.source_names.iter().position(|s| s.as_ref() == source)? as u8;
-        let sess_id = self.sessions.iter().position(|s| s.as_ref() == session_id)? as u32;
+        let src_id = self
+            .source_names
+            .iter()
+            .position(|s| s.as_ref() == source)? as u8;
+        let sess_id = self
+            .sessions
+            .iter()
+            .position(|s| s.as_ref() == session_id)? as u32;
         let mut idxs: Vec<usize> = (0..self.docs.len())
             .filter(|&i| {
                 self.docs[i].source == src_id
@@ -1344,7 +1440,10 @@ impl ContextIndex {
         let (tokens, bigrams) = grams_of(query);
         let mut terms: Vec<QueryTerm> = Vec::new();
         for t in tokens {
-            if terms.iter().any(|x| x.kind == TermKind::Ascii && x.text == t) {
+            if terms
+                .iter()
+                .any(|x| x.kind == TermKind::Ascii && x.text == t)
+            {
                 continue;
             }
             // ASCII df counts prefix matches, not one vocab entry, so a
@@ -1370,7 +1469,10 @@ impl ContextIndex {
             });
         }
         for g in bigrams {
-            if terms.iter().any(|x| x.kind == TermKind::Gram && x.text == g) {
+            if terms
+                .iter()
+                .any(|x| x.kind == TermKind::Gram && x.text == g)
+            {
                 continue;
             }
             let df = self.cjk.get(g.as_str()).map_or(0, |s| s.len as usize);
@@ -1386,10 +1488,7 @@ impl ContextIndex {
         // docs are still findable by substring: emit it as a df-0 Gram so the
         // pool stage takes the verified full scan.
         if terms.is_empty() {
-            let cjk_chars: Vec<char> = query
-                .chars()
-                .filter(|c| is_cjk(*c))
-                .collect();
+            let cjk_chars: Vec<char> = query.chars().filter(|c| is_cjk(*c)).collect();
             if cjk_chars.len() == 1 {
                 terms.push(QueryTerm {
                     text: cjk_chars[0].to_string(),
@@ -1418,8 +1517,7 @@ impl ContextIndex {
                 // distribution is corpus glue even when the absolute line
                 // hasn't caught up with growth (tool layer tripled N).
                 if n_vocab > 0 && t.df > 64 {
-                    let greater = n_vocab
-                        - self.df_hist.partition_point(|&d| (d as usize) <= t.df);
+                    let greater = n_vocab - self.df_hist.partition_point(|&d| (d as usize) <= t.df);
                     if (greater as f64) / (n_vocab as f64) <= 0.001 {
                         return false;
                     }
@@ -1461,9 +1559,7 @@ impl ContextIndex {
     fn candidate_pool(&self, terms: &[QueryTerm]) -> (Vec<u32>, u8, usize) {
         // A lone CJK char ("税" against docs that only ever say 税务) forms
         // no bigram: a verified full scan is the only honest answer.
-        if terms.len() == 1
-            && terms[0].kind == TermKind::Gram
-            && terms[0].text.chars().count() == 1
+        if terms.len() == 1 && terms[0].kind == TermKind::Gram && terms[0].text.chars().count() == 1
         {
             return ((0..self.docs.len() as u32).collect(), 1, 0);
         }
@@ -1484,7 +1580,7 @@ impl ContextIndex {
 
         // Tier 1: AND over the rarest content terms — ASCII tokens and CJK
         // bigrams alike, since both split identically on query and doc side.
-        let mut drive: Vec<&QueryTerm> = content.iter().copied().collect();
+        let mut drive: Vec<&QueryTerm> = content.to_vec();
         if drive.len() > POOL_TERMS_MAX {
             drive.sort_by_key(|t| t.df); // rarest first; stable for ties
             drive.truncate(POOL_TERMS_MAX);
@@ -1521,7 +1617,8 @@ impl ContextIndex {
                     }
                     let mut tail: Vec<(u32, f64)> = weights.into_iter().collect();
                     tail.sort_by(|a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        b.1.partial_cmp(&a.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
                             .then(a.0.cmp(&b.0))
                     });
                     tail.truncate(SOFT_AND_BACKFILL_MAX);
@@ -1597,7 +1694,9 @@ impl ContextIndex {
                 // from an AND means every member matched everything asked,
                 // so recency is the only tiebreaker left.
                 pool.sort_by(|a, b| {
-                    self.docs[*b as usize].timestamp.cmp(&self.docs[*a as usize].timestamp)
+                    self.docs[*b as usize]
+                        .timestamp
+                        .cmp(&self.docs[*a as usize].timestamp)
                 });
                 pool.truncate(MAX_VERIFY_CANDIDATES);
             }
@@ -1618,7 +1717,13 @@ impl ContextIndex {
         let src_filter = filter
             .source
             .and_then(|s| self.source_names.iter().position(|x| x.as_ref() == s));
-        let role_filter = filter.role.map(|r| if r == "user" { ROLE_USER } else { ROLE_ASSISTANT });
+        let role_filter = filter.role.map(|r| {
+            if r == "user" {
+                ROLE_USER
+            } else {
+                ROLE_ASSISTANT
+            }
+        });
         let excluded: Vec<u32> = filter
             .exclude_sessions
             .iter()
@@ -1733,7 +1838,11 @@ impl ContextIndex {
         let verify_us = t_verify.elapsed().as_micros() as u64;
         let matched = hits.len();
 
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // R3 (O8 simplified): digests pop out of the ranked list into
         // `session_headers`; a session whose digest matched the query gets a
@@ -1756,7 +1865,11 @@ impl ContextIndex {
                     h.score += 0.25;
                 }
             }
-            hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
 
         // Near-duplicate suppression + human-voice top-up. Agents quote the
@@ -1771,19 +1884,23 @@ impl ContextIndex {
         //      inserted right after the session's first survivor.
         let mut scored: Vec<Option<(SearchHit, HashSet<u64>)>> = hits
             .into_iter()
-            .zip(hit_shingles.into_iter())
+            .zip(hit_shingles)
             .map(|(h, s)| Some((h, s)))
             .collect();
         scored.sort_by(|a, b| {
             let (a, b) = (a.as_ref().unwrap(), b.as_ref().unwrap());
-            b.0.score.partial_cmp(&a.0.score).unwrap_or(std::cmp::Ordering::Equal)
+            b.0.score
+                .partial_cmp(&a.0.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let mut kept: Vec<SearchHit> = Vec::with_capacity(scored.len());
         let mut kept_shingles: Vec<HashSet<u64>> = Vec::with_capacity(scored.len());
         let mut deduped = 0usize;
-        for i in 0..scored.len() {
-            let Some((hit, cand)) = scored[i].take() else { continue };
+        for slot in scored.iter_mut() {
+            let Some((hit, cand)) = slot.take() else {
+                continue;
+            };
             // Tool docs are never fold candidates: they are the origin of the
             // output, and a user/assistant message quoting it is the echo. The
             // echo's shingle set contains the synopsis's — without this rule
@@ -1796,16 +1913,17 @@ impl ContextIndex {
             // Assistant docs fold aggressively: restatement and quote-heavy
             // answers are the noise. A person repeating themselves is worth
             // seeing, so user docs fold only onto other user docs, stricter.
-            let containment_floor = if hit.role == "user" { 0.7 } else { DUPLICATE_CONTAINMENT };
+            let containment_floor = if hit.role == "user" {
+                0.7
+            } else {
+                DUPLICATE_CONTAINMENT
+            };
             let dup_pos = if cand.len() >= MIN_SHINGLES_FOR_DUP {
-                kept_shingles
-                    .iter()
-                    .zip(kept.iter())
-                    .position(|(ks, k)| {
-                        k.session_id == hit.session_id
-                            && ks.intersection(&cand).count() as f64 / cand.len() as f64
-                                >= containment_floor
-                    })
+                kept_shingles.iter().zip(kept.iter()).position(|(ks, k)| {
+                    k.session_id == hit.session_id
+                        && ks.intersection(&cand).count() as f64 / cand.len() as f64
+                            >= containment_floor
+                })
             } else {
                 None
             };
@@ -1842,11 +1960,17 @@ impl ContextIndex {
                 continue;
             }
             let anchor = &kept[pos];
-            let (src, before_ts, base_score, doc_id) =
-                (anchor.source.as_str(), anchor.timestamp, anchor.score, anchor.doc_id_str.clone());
+            let (src, before_ts, base_score, doc_id) = (
+                anchor.source.as_str(),
+                anchor.timestamp,
+                anchor.score,
+                anchor.doc_id_str.clone(),
+            );
             let src_id = self.source_names.iter().position(|x| x.as_ref() == src);
             let sess_id = self.sessions.iter().position(|x| x.as_ref() == sid);
-            let (Some(src_id), Some(sess_id)) = (src_id, sess_id) else { continue };
+            let (Some(src_id), Some(sess_id)) = (src_id, sess_id) else {
+                continue;
+            };
             let mut best: Option<usize> = None;
             for (i, d) in self.docs.iter().enumerate() {
                 if d.source as usize == src_id
@@ -1866,18 +1990,21 @@ impl ContextIndex {
             let text = self.doc_text(ui);
             let lower = text.to_lowercase();
             injected.insert(sid);
-            insertions.push((pos + 1, SearchHit {
-                doc_id_str: meta.doc_id.to_string(),
-                source: self.source_names[meta.source as usize].to_string(),
-                session_id: self.sessions[meta.session as usize].to_string(),
-                role: ROLE_NAMES[meta.role as usize],
-                timestamp: meta.timestamp,
-                score: base_score - 0.01,
-                snippet: extract_snippet(&text, &lower, 0),
-                project: project_label(&self.projects[meta.project as usize]),
-                title: self.session_title(meta),
-                truncated: meta.truncated,
-            }));
+            insertions.push((
+                pos + 1,
+                SearchHit {
+                    doc_id_str: meta.doc_id.to_string(),
+                    source: self.source_names[meta.source as usize].to_string(),
+                    session_id: self.sessions[meta.session as usize].to_string(),
+                    role: ROLE_NAMES[meta.role as usize],
+                    timestamp: meta.timestamp,
+                    score: base_score - 0.01,
+                    snippet: extract_snippet(&text, &lower, 0),
+                    project: project_label(&self.projects[meta.project as usize]),
+                    title: self.session_title(meta),
+                    truncated: meta.truncated,
+                },
+            ));
         }
         for (pos, hit) in insertions.into_iter().rev() {
             kept.insert(pos, hit);
@@ -1886,7 +2013,11 @@ impl ContextIndex {
         hits.truncate(filter.limit.max(1));
         let returned = hits.len();
 
-        session_headers.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        session_headers.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         SearchResponse {
             query: trimmed.to_string(),
             elapsed_ms: t0.elapsed().as_millis() as u64,
@@ -1948,7 +2079,13 @@ fn extract_snippet(text: &str, lower: &str, pos: usize) -> String {
     if start > 0 {
         snippet.push('…');
     }
-    snippet.push_str(text.chars().skip(start).take(end - start).collect::<String>().trim_start());
+    snippet.push_str(
+        text.chars()
+            .skip(start)
+            .take(end - start)
+            .collect::<String>()
+            .trim_start(),
+    );
     if end < total_chars {
         snippet.push('…');
     }
@@ -2119,6 +2256,11 @@ pub struct ContextHandle {
     clicks_path: PathBuf,
     clicks: RwLock<HashMap<i64, u64>>,
     inner: RwLock<Inner>,
+    /// Serializes [`ContextHandle::sync_and_build`]. A run reads the stored
+    /// doc ids once as its dedupe baseline, so two overlapping runs — the
+    /// boot-time background build and a `/api/sync`-triggered refresh — would
+    /// each import the whole corpus and double every row.
+    build_lock: Mutex<()>,
 }
 
 struct Inner {
@@ -2157,7 +2299,10 @@ fn append_search_line(path: &Path, line: &str, rotate_over: u64) -> std::io::Res
             let _ = std::fs::rename(path, path.with_extension("jsonl.1"));
         }
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     writeln!(f, "{line}")
 }
 
@@ -2173,8 +2318,13 @@ impl ContextHandle {
             clicks: RwLock::new(clicks),
             inner: RwLock::new(Inner {
                 index: None,
-                status: ContextStatus { phase: Phase::Empty, detail: None, last_sync: None },
+                status: ContextStatus {
+                    phase: Phase::Empty,
+                    detail: None,
+                    last_sync: None,
+                },
             }),
+            build_lock: Mutex::new(()),
         }
     }
 
@@ -2197,11 +2347,21 @@ impl ContextHandle {
         let mut entries: Vec<(i64, String, usize, u8, u64)> = Vec::new();
         if let Ok(text) = std::fs::read_to_string(&self.search_log_path) {
             for line in text.lines() {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
                 let ts = v.get("ts").and_then(|x| x.as_i64()).unwrap_or(0);
-                let q = v.get("query").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let q = v
+                    .get("query")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let returned = v.get("returned").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-                let tier = v.get("trace").and_then(|t| t.get("tier")).and_then(|x| x.as_u64()).unwrap_or(0) as u8;
+                let tier = v
+                    .get("trace")
+                    .and_then(|t| t.get("tier"))
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0) as u8;
                 let ms = v.get("elapsed_ms").and_then(|x| x.as_u64()).unwrap_or(0);
                 entries.push((ts, q, returned, tier, ms));
             }
@@ -2213,7 +2373,9 @@ impl ContextHandle {
         let mut lats: Vec<u64> = entries.iter().map(|e| e.4).collect();
         lats.sort_unstable();
         let p = |f: f64| -> u64 {
-            if lats.is_empty() { return 0; }
+            if lats.is_empty() {
+                return 0;
+            }
             lats[((lats.len() as f64 - 1.0) * f).round() as usize]
         };
         let bad: Vec<BadQuery> = entries
@@ -2221,7 +2383,12 @@ impl ContextHandle {
             .filter(|e| e.2 == 0 || e.3 == 3)
             .rev()
             .take(10)
-            .map(|e| BadQuery { ts: e.0, query: e.1.clone(), returned: e.2, tier: e.3 })
+            .map(|e| BadQuery {
+                ts: e.0,
+                query: e.1.clone(),
+                returned: e.2,
+                tier: e.3,
+            })
             .collect();
         QualityStats {
             total,
@@ -2240,10 +2407,8 @@ impl ContextHandle {
         let c = clicks.entry(doc_id).or_insert(0);
         *c += 1;
         let n = *c;
-        let snapshot: std::collections::BTreeMap<String, u64> = clicks
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect();
+        let snapshot: std::collections::BTreeMap<String, u64> =
+            clicks.iter().map(|(k, v)| (k.to_string(), *v)).collect();
         drop(clicks);
         let body = serde_json::to_string(&snapshot).unwrap_or_default();
         let tmp = self.clicks_path.with_extension("json.tmp");
@@ -2262,6 +2427,9 @@ impl ContextHandle {
     /// Incremental collect+dedupe of conversations, then rebuild the index
     /// and swap it in. `clear` drops the stored parquet first (full rebuild).
     pub fn sync_and_build(&self, clear: bool) -> Result<SyncStats> {
+        // Held for the whole run so overlapping refreshes queue up instead of
+        // each importing the corpus against the same stale dedupe baseline.
+        let _build_guard = self.build_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.set_phase(Phase::Syncing, None);
         if clear {
             let _ = std::fs::remove_file(&self.parquet_path);
@@ -2303,7 +2471,11 @@ impl ContextHandle {
     }
 
     pub fn status(&self) -> ContextStatus {
-        self.inner.read().unwrap_or_else(|e| e.into_inner()).status.clone()
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .status
+            .clone()
     }
 
     pub fn index_stats(&self) -> Option<IndexStats> {
@@ -2334,7 +2506,11 @@ impl ContextHandle {
         let Some(index) = &inner.index else {
             anyhow::bail!("上下文索引尚未就绪（{}）", inner.status.phase_desc());
         };
-        let clicks = self.clicks.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let clicks = self
+            .clicks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let resp = index.search_with_clicks(query, filter, &clicks);
         self.log_search(query, filter, &resp);
         // One compact line per query: tier, pool funnel and stage timings —
@@ -2406,7 +2582,10 @@ mod tests {
 
     #[test]
     fn normalize_collapses_whitespace_and_case() {
-        assert_eq!(normalize("  Hello   WORLD \n\t again "), "hello world again");
+        assert_eq!(
+            normalize("  Hello   WORLD \n\t again "),
+            "hello world again"
+        );
         assert_eq!(normalize("上下文  搜索"), "上下文 搜索");
     }
 
@@ -2508,9 +2687,18 @@ mod tests {
         let index = ContextIndex::build(&path)?;
         assert_eq!(index.stats().docs, 3, "in-session duplicate collapsed");
 
-        let resp = index.search("parquet 写入", &SearchFilter { limit: 10, ..Default::default() });
+        let resp = index.search(
+            "parquet 写入",
+            &SearchFilter {
+                limit: 10,
+                ..Default::default()
+            },
+        );
         assert_eq!(resp.results.len(), 3, "every doc mentions both terms");
-        assert!(resp.results.iter().all(|h| h.snippet.contains("parquet") || h.snippet.contains("写入")));
+        assert!(resp
+            .results
+            .iter()
+            .all(|h| h.snippet.contains("parquet") || h.snippet.contains("写入")));
         // The exact phrase is present in three docs → phrase bonus lifts the
         // best match to the top and keeps the order stable.
         assert!(resp.results[0].score >= resp.results.last().unwrap().score);
@@ -2519,13 +2707,23 @@ mod tests {
 
         // AND semantics: an ASCII term nothing contains empties the pool even
         // though a CJK gram would soft-match.
-        let resp = index.search("写入 nonexistentword", &SearchFilter { limit: 10, ..Default::default() });
+        let resp = index.search(
+            "写入 nonexistentword",
+            &SearchFilter {
+                limit: 10,
+                ..Default::default()
+            },
+        );
         assert!(resp.results.is_empty());
 
         // role filter
         let resp = index.search(
             "parquet",
-            &SearchFilter { role: Some("user"), limit: 10, ..Default::default() },
+            &SearchFilter {
+                role: Some("user"),
+                limit: 10,
+                ..Default::default()
+            },
         );
         assert_eq!(resp.results.len(), 2);
         assert!(resp.results.iter().all(|h| h.role == "user"));
@@ -2533,13 +2731,23 @@ mod tests {
         // source filter
         let resp = index.search(
             "parquet",
-            &SearchFilter { source: Some("zcode"), limit: 10, ..Default::default() },
+            &SearchFilter {
+                source: Some("zcode"),
+                limit: 10,
+                ..Default::default()
+            },
         );
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.results[0].source, "zcode");
 
         // single CJK char query falls back to the full-scan pool
-        let resp = index.search("税", &SearchFilter { limit: 10, ..Default::default() });
+        let resp = index.search(
+            "税",
+            &SearchFilter {
+                limit: 10,
+                ..Default::default()
+            },
+        );
         assert!(resp.results.is_empty(), "char absent from corpus");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2572,7 +2780,13 @@ mod tests {
         // "下文搜" spans the 上下文|搜索 word boundary: no doc-side jieba
         // word equals it, so the word tier must soft-miss and the bigram
         // tier (下文 + 文搜) has to carry the recall.
-        let resp = index.search("下文搜", &SearchFilter { limit: 10, ..Default::default() });
+        let resp = index.search(
+            "下文搜",
+            &SearchFilter {
+                limit: 10,
+                ..Default::default()
+            },
+        );
         assert_eq!(resp.results.len(), 1, "cross-boundary fragment must hit");
         assert!(resp.results[0].snippet.contains("上下文搜索"));
 
@@ -2620,15 +2834,24 @@ mod tests {
 
         let resp = index.search(
             "上次讨论的权限问题怎么解决的",
-            &SearchFilter { limit: 10, ..Default::default() },
+            &SearchFilter {
+                limit: 10,
+                ..Default::default()
+            },
         );
         assert!(!resp.results.is_empty(), "content terms must still hit");
         assert!(
             resp.results.iter().all(|h| h.snippet.contains("权限")),
             "only 权限 docs may rank, got: {:?}",
-            resp.results.iter().map(|h| h.snippet.clone()).collect::<Vec<_>>()
+            resp.results
+                .iter()
+                .map(|h| h.snippet.clone())
+                .collect::<Vec<_>>()
         );
-        assert!(!resp.terms.contains(&"的".to_string()), "stopword leaked into highlight terms");
+        assert!(
+            !resp.terms.contains(&"的".to_string()),
+            "stopword leaked into highlight terms"
+        );
         assert!(resp.trace.terms_content >= 1);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2637,7 +2860,8 @@ mod tests {
 
     #[test]
     fn verbose_query_pools_on_rarest_terms_only() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_verbose_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("tokenbuddy_ctx_verbose_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("context.parquet");
@@ -2680,10 +2904,16 @@ mod tests {
 
         let resp = index.search(
             "权限 部署 讨论 失败",
-            &SearchFilter { limit: 10, ..Default::default() },
+            &SearchFilter {
+                limit: 10,
+                ..Default::default()
+            },
         );
         assert_eq!(resp.trace.tier, 1, "rarest-3 AND should carry the pool");
-        assert!(!resp.results.is_empty(), "docA must be findable without 部署");
+        assert!(
+            !resp.results.is_empty(),
+            "docA must be findable without 部署"
+        );
         assert!(resp.results[0].snippet.contains("失败"));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2708,7 +2938,8 @@ mod tests {
 
     #[test]
     fn prefix_query_matches_partial_tokens() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_prefix_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("tokenbuddy_ctx_prefix_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("context.parquet");
@@ -2729,9 +2960,21 @@ mod tests {
         write_context_parquet(&path, &docs_to_batch(&docs))?;
         let index = ContextIndex::build(&path)?;
 
-        let resp = index.search("zcod", &SearchFilter { limit: 10, ..Default::default() });
+        let resp = index.search(
+            "zcod",
+            &SearchFilter {
+                limit: 10,
+                ..Default::default()
+            },
+        );
         assert_eq!(resp.results.len(), 1, "prefix of a 5-char token matches");
-        let resp = index.search("zt", &SearchFilter { limit: 10, ..Default::default() });
+        let resp = index.search(
+            "zt",
+            &SearchFilter {
+                limit: 10,
+                ..Default::default()
+            },
+        );
         assert!(resp.results.is_empty(), "short tokens match exactly only");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2754,7 +2997,8 @@ mod search_regression {
     /// unique — nothing dedupes, every row is a doc. Returns the index and
     /// its temp dir (caller removes it).
     fn reg_index(name: &str, docs: &[(i64, &str)]) -> (ContextIndex, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_reg_{name}_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("tokenbuddy_ctx_reg_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("context.parquet");
@@ -2781,13 +3025,20 @@ mod search_regression {
         (ContextIndex::build(&path).unwrap(), dir)
     }
 
-    fn search<'a>(index: &'a ContextIndex, q: &str) -> SearchResponse {
-        index.search(q, &SearchFilter { limit: 10, ..Default::default() })
+    fn search(index: &ContextIndex, q: &str) -> SearchResponse {
+        index.search(
+            q,
+            &SearchFilter {
+                limit: 10,
+                ..Default::default()
+            },
+        )
     }
 
     /// Like `reg_index`, with an explicit project per doc.
     fn reg_index_proj(name: &str, docs: &[(i64, &str, &str)]) -> (ContextIndex, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_regp_{name}_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("tokenbuddy_ctx_regp_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("context.parquet");
@@ -2825,16 +3076,24 @@ mod search_regression {
             .unwrap()
             .to_string();
         assert_eq!(project_label(""), "");
-        assert_eq!(project_label(&format!("{}/code/foo", home.display())), "code/foo");
+        assert_eq!(
+            project_label(&format!("{}/code/foo", home.display())),
+            "code/foo"
+        );
         assert_eq!(project_label(&format!("{}/code", home.display())), "code");
-        assert_eq!(project_label(&format!("-Users-{user}-code-bar")), "code-bar");
+        assert_eq!(
+            project_label(&format!("-Users-{user}-code-bar")),
+            "code-bar"
+        );
         assert_eq!(
             project_label(&format!("--Users-{user}-code-baz--")),
             "code-baz"
         );
         // Qoder's per-session date+hash tail collapses to one label.
         assert_eq!(
-            project_label(&format!("-Users-{user}-Documents-Qoder-2026-08-28-a42def97")),
+            project_label(&format!(
+                "-Users-{user}-Documents-Qoder-2026-08-28-a42def97"
+            )),
             "Documents-Qoder"
         );
         // Unknown shapes pass through trimmed.
@@ -2858,14 +3117,21 @@ mod search_regression {
 
         // Labels surface on hits and in stats.
         let resp = search(&index, "权限");
-        assert!(resp.results.iter().all(|h| h.project == "code/alpha" || h.project == "code/beta"));
+        assert!(resp
+            .results
+            .iter()
+            .all(|h| h.project == "code/alpha" || h.project == "code/beta"));
         assert_eq!(index.stats().by_project.get("code/alpha"), Some(&3));
         assert_eq!(index.stats().by_project.get("code/beta"), Some(&1));
 
         // The filter narrows to one project's docs.
         let resp = index.search(
             "权限",
-            &SearchFilter { project: Some("code/beta"), limit: 10, ..Default::default() },
+            &SearchFilter {
+                project: Some("code/beta"),
+                limit: 10,
+                ..Default::default()
+            },
         );
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.results[0].project, "code/beta");
@@ -2923,7 +3189,9 @@ mod search_regression {
             .find(|h| h.session_id == "s1" && h.snippet.contains("第四步"))
             .expect("anchor hit must be searchable");
         let anchor_id = hit.doc_id_str.parse::<i64>().unwrap();
-        let view = index.session_view("zcode", "s1", anchor_id, 2).expect("session must exist");
+        let view = index
+            .session_view("zcode", "s1", anchor_id, 2)
+            .expect("session must exist");
         assert_eq!(view.total, 7);
         assert_eq!(view.anchor_pos, 3);
         assert_eq!(view.window_start, 1);
@@ -3011,10 +3279,20 @@ mod search_regression {
         assert!(resp.results.iter().all(|h| h.title == "最终标题"));
         // No explicit title → first user message, whitespace collapsed.
         let resp = search(&index, "部署");
-        assert!(resp.results.iter().all(|h| h.title == "部署 失败了 怎么排查"));
+        assert!(resp
+            .results
+            .iter()
+            .all(|h| h.title == "部署 失败了 怎么排查"));
         // Session view carries the same title.
         let hit = resp.results[0].clone();
-        let view = index.session_view("zcode", &hit.session_id, hit.doc_id_str.parse::<i64>().unwrap(), 5).unwrap();
+        let view = index
+            .session_view(
+                "zcode",
+                &hit.session_id,
+                hit.doc_id_str.parse::<i64>().unwrap(),
+                5,
+            )
+            .unwrap();
         assert_eq!(view.title, "部署 失败了 怎么排查");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3022,7 +3300,8 @@ mod search_regression {
 
     #[test]
     fn legacy_parquet_without_project_rebuilds() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_legacy_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("tokenbuddy_ctx_legacy_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("context.parquet");
@@ -3056,7 +3335,10 @@ mod search_regression {
                 title: String::new(),
             }],
         )?;
-        assert_eq!(stats.total_docs, 1, "legacy rows must be discarded, not merged");
+        assert_eq!(
+            stats.total_docs, 1,
+            "legacy rows must be discarded, not merged"
+        );
         assert!(parquet_is_current_schema(&path));
 
         let index = ContextIndex::build(&path)?;
@@ -3083,7 +3365,10 @@ mod search_regression {
         let (index, dir) = reg_index("verbose_ascii", &texts);
         let resp = search(&index, "权限 部署 讨论 失败 zzznotaword");
         assert_eq!(resp.trace.tier, 1);
-        assert!(!resp.results.is_empty(), "verbose query must not die on a missing token");
+        assert!(
+            !resp.results.is_empty(),
+            "verbose query must not die on a missing token"
+        );
         assert!(resp.results[0].snippet.contains("权限"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3093,12 +3378,28 @@ mod search_regression {
         // Every doc is 100% 「的」 docs — no content terms exist. The
         // fallback scoring set must still rank and return them.
         let texts: Vec<(i64, &str)> = (0..6)
-            .map(|i| (1 + i, if i % 2 == 0 { "好的知道了记录" } else { "谁的文件发过了" }))
+            .map(|i| {
+                (
+                    1 + i,
+                    if i % 2 == 0 {
+                        "好的知道了记录"
+                    } else {
+                        "谁的文件发过了"
+                    },
+                )
+            })
             .collect();
         let (index, dir) = reg_index("all_stop", &texts);
         let resp = search(&index, "的");
-        assert_eq!(resp.trace.terms_content, 0, "nothing is below the stopword line");
-        assert_eq!(resp.results.len(), 6, "fallback must still return every match");
+        assert_eq!(
+            resp.trace.terms_content, 0,
+            "nothing is below the stopword line"
+        );
+        assert_eq!(
+            resp.results.len(),
+            6,
+            "fallback must still return every match"
+        );
         assert_eq!(resp.trace.tier, 1, "lone-char query is a full-scan pool");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3122,7 +3423,12 @@ mod search_regression {
         // "the" covers 60% of the corpus — an ASCII stopword by evidence. It
         // must not join the AND, and it must not leak into highlight terms.
         let mut texts: Vec<(i64, String)> = (0..6)
-            .map(|i| (1 + i as i64, format!("the daily report volume {i} looks fine")))
+            .map(|i| {
+                (
+                    1 + i as i64,
+                    format!("the daily report volume {i} looks fine"),
+                )
+            })
             .collect();
         texts.push((7, "parquet schema definition".into()));
         texts.push((8, "parquet writer tuning".into()));
@@ -3134,7 +3440,10 @@ mod search_regression {
         assert_eq!(resp.trace.tier, 1);
         assert_eq!(resp.results.len(), 2);
         assert!(resp.results.iter().all(|h| h.snippet.contains("parquet")));
-        assert!(!resp.terms.contains(&"the".to_string()), "stopword leaked into highlights");
+        assert!(
+            !resp.terms.contains(&"the".to_string()),
+            "stopword leaked into highlights"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3156,7 +3465,10 @@ mod search_regression {
         assert!(
             resp.results[0].snippet.contains("fox"),
             "adjacent phrase must outrank the scattered mention: {:?}",
-            resp.results.iter().map(|h| h.snippet.clone()).collect::<Vec<_>>()
+            resp.results
+                .iter()
+                .map(|h| h.snippet.clone())
+                .collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3183,7 +3495,10 @@ mod search_regression {
         assert!(
             resp.results[0].snippet.contains("权限"),
             "rarest-term doc must rank first: {:?}",
-            resp.results.iter().map(|h| h.snippet.clone()).collect::<Vec<_>>()
+            resp.results
+                .iter()
+                .map(|h| h.snippet.clone())
+                .collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3199,9 +3514,16 @@ mod search_regression {
         let (index, dir) = reg_index("since", &texts);
         let resp = index.search(
             "权限",
-            &SearchFilter { since: Some(2_000), limit: 10, ..Default::default() },
+            &SearchFilter {
+                since: Some(2_000),
+                limit: 10,
+                ..Default::default()
+            },
         );
-        assert_eq!(resp.trace.verified, 3, "time filter should cut the pool before verify");
+        assert_eq!(
+            resp.trace.verified, 3,
+            "time filter should cut the pool before verify"
+        );
         assert_eq!(resp.results.len(), 3);
         assert!(resp.results.iter().all(|h| h.timestamp >= 2_000));
         std::fs::remove_dir_all(&dir).ok();
@@ -3275,8 +3597,11 @@ mod search_regression {
         let index = ContextIndex::build(&path).unwrap();
 
         let resp = search(&index, "部署失败");
-        let roles: Vec<(&str, &str)> =
-            resp.results.iter().map(|h| (h.session_id.as_str(), h.role)).collect();
+        let roles: Vec<(&str, &str)> = resp
+            .results
+            .iter()
+            .map(|h| (h.session_id.as_str(), h.role))
+            .collect();
         assert!(
             roles.contains(&("s1", "user")) && roles.contains(&("s2", "user")),
             "each session's human line must be surfaced next to its reply: {roles:?}"
@@ -3295,7 +3620,8 @@ mod search_regression {
                 "{sid}: the ranked reply leads"
             );
             assert_eq!(
-                resp.results[positions[0] + 1].role, "user",
+                resp.results[positions[0] + 1].role,
+                "user",
                 "{sid}: the triggering human line sits right after it"
             );
         }
@@ -3369,9 +3695,13 @@ mod search_regression {
 
         let resp = search(&index, "权限校验失败 日志");
         assert_eq!(
-            resp.trace.deduped, 1,
+            resp.trace.deduped,
+            1,
             "the restating reply must fold: {:?}",
-            resp.results.iter().map(|h| (h.role, h.snippet.clone())).collect::<Vec<_>>()
+            resp.results
+                .iter()
+                .map(|h| (h.role, h.snippet.clone()))
+                .collect::<Vec<_>>()
         );
         assert_eq!(resp.results.len(), 2, "one per session survives");
         let sessions: Vec<&str> = resp.results.iter().map(|h| h.session_id.as_str()).collect();
@@ -3379,7 +3709,10 @@ mod search_regression {
         assert!(
             resp.results.iter().all(|h| h.role == "user"),
             "every survivor is the human's wording, not its echo: {:?}",
-            resp.results.iter().map(|h| (h.role, h.session_id.as_str())).collect::<Vec<_>>()
+            resp.results
+                .iter()
+                .map(|h| (h.role, h.session_id.as_str()))
+                .collect::<Vec<_>>()
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3412,18 +3745,43 @@ mod search_regression {
             let resp = search(&index, q);
             let t = &resp.trace;
             assert!(t.tier <= 3, "{q:?}: tier {}", t.tier);
-            assert!(t.pool <= t.pool_from, "{q:?}: pool {} > {}", t.pool, t.pool_from);
-            assert!(t.verified <= t.pool, "{q:?}: verified {} > pool {}", t.verified, t.pool);
-            assert!(t.matched <= t.verified, "{q:?}: matched {} > verified {}", t.matched, t.verified);
-            assert!(t.returned <= t.matched, "{q:?}: returned {} > matched {}", t.returned, t.matched);
-            assert!(t.terms_content <= t.terms_total, "{q:?}: content {}", t.terms_content);
+            assert!(
+                t.pool <= t.pool_from,
+                "{q:?}: pool {} > {}",
+                t.pool,
+                t.pool_from
+            );
+            assert!(
+                t.verified <= t.pool,
+                "{q:?}: verified {} > pool {}",
+                t.verified,
+                t.pool
+            );
+            assert!(
+                t.matched <= t.verified,
+                "{q:?}: matched {} > verified {}",
+                t.matched,
+                t.verified
+            );
+            assert!(
+                t.returned <= t.matched,
+                "{q:?}: returned {} > matched {}",
+                t.returned,
+                t.matched
+            );
+            assert!(
+                t.terms_content <= t.terms_total,
+                "{q:?}: content {}",
+                t.terms_content
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn search_log_appends_and_rotates() {
-        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_logrot_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("tokenbuddy_ctx_logrot_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("search-log.jsonl");
@@ -3435,14 +3793,18 @@ mod search_regression {
 
         let rotated = dir.join("search-log.jsonl.1");
         assert!(rotated.exists(), "old log must rotate to .1");
-        assert_eq!(std::fs::read_to_string(&rotated).unwrap().lines().count(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap().lines().count(),
+            2
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "last\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn handle_writes_search_log_jsonl() {
-        let dir = std::env::temp_dir().join(format!("tokenbuddy_ctx_loghandle_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("tokenbuddy_ctx_loghandle_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let handle = ContextHandle::new(dir.join("context.parquet"));
@@ -3472,7 +3834,10 @@ mod search_regression {
         };
         handle.log_search(
             "回归查询",
-            &SearchFilter { limit: 30, ..Default::default() },
+            &SearchFilter {
+                limit: 30,
+                ..Default::default()
+            },
             &resp,
         );
         let line = std::fs::read_to_string(dir.join("search-log.jsonl")).unwrap();

@@ -20,6 +20,42 @@ cargo test --release
 - 保持 `target/` 只保留 release 产物；如需深度清理，保留
   `target/release/tokenbuddy` 二进制即可。
 
+## 质量门禁（CI/CD）
+
+单一入口是 `scripts/check.sh`：`cargo fmt --check` → `clippy --release
+--all-targets -D warnings` → `cargo test --release` → release 构建后检查二进制
+体积（默认上限 8 MB，`TOKENBUDDY_SIZE_LIMIT_MB` 可调；README 主打 4.1 MB，
+上限放宽到 2 倍只为拦住"拖进重依赖"级别的事故，如当年 DuckDB +19 MB）。
+
+三道闸共用这一个脚本，改检查只改这里：
+
+1. **本地 pre-push 钩子**（已生效）：`git config core.hooksPath .githooks`
+   指向 `.githooks/pre-push`，push 前全量跑一遍。应急绕过用
+   `git push --no-verify`（CI 会再拦一次），不要把绕过当习惯。
+2. **内网 Gitea Actions（flod3 host runner）**：`.gitea/workflows/ci-flod3.yml`，
+   push main / 手动触发时在 flod3（Galaxy Z Fold3 上的 Termux，无 Docker）
+   跑同一份 gate，全量约 8 分钟。runner 常驻：flod3 的
+   `~/act_runner/gitea-runner`（v4），由 `sv` 监管为服务 `act_runner`，
+   label `termux-host`（host 执行模式），只在 flod3 在线时接活，离线任务
+   排队。CI 里 `CARGO_TARGET_DIR` 指向 `~/act_runner/target-cache` 持久化，
+   后续 push 增量编译。**不用 actions/checkout**：runner 是 Go 二进制，
+   Android 没有 /etc/resolv.conf，解析不了 github.com（git/cargo 走系统
+   解析没这问题），改用 git 直接克隆。该 Gitea 实测只索引
+   `.gitea/workflows/`（ci.yml 未被读取，无 pending 噪音）。
+3. **GitHub 公开仓**：ci.yml 随发布流推上去即生效（公开仓 Actions 免费）。
+
+**失败闭环（watchdog）**：box 上 `/usr/local/bin/tokenbuddy-ci-watchdog.py`
+（cron 每 2 分钟，配置 `/etc/tokenbuddy-watchdog.conf`，root 600）轮询 Gitea
+API：CI 失败 → 飞书群机器人 ❌（标题+链接+日志尾部），只报一次；修复 push
+变绿后补 ✅ 收尾。flod3 runner 掉线 ⚠️（30 分钟冷却重报，防手机没电后任务
+静默排队）/恢复在线 ✅。首次启动只标记历史失败不追溯。`FEISHU_WEBHOOK` 留空
+时一切照常运行只是不发消息——填入群自定义机器人地址后，在 box 跑
+`python3 /usr/local/bin/tokenbuddy-ci-watchdog.py --test` 验证链路。
+
+新代码必须保持 fmt/clippy 干净。个别 lint 确有理由保留时，用带注释的
+`#[allow]`（仓库现有先例：`acc_record` / `push_doc` 的参数个数），不要全仓
+降级 lint 等级。
+
 ## 双远程发布纪律
 
 本仓库有两个远程：`origin`（内网，完整私有历史）和 `github`（公开，
@@ -29,7 +65,7 @@ cargo test --release
 
 ```bash
 git checkout -B public-release github/main
-git checkout main -- .cargo CLAUDE.md Cargo.lock Cargo.toml LICENSE README.md README.zh-CN.md docs/screenshot-dashboard.png src skills examples/memprobe.rs
+git checkout main -- .cargo .github CLAUDE.md Cargo.lock Cargo.toml LICENSE README.md README.zh-CN.md docs/screenshot-dashboard.png src skills examples/memprobe.rs
 git rm src/tools.rs  # 若已删除
 git diff --cached main --stat -- . ':(exclude)analysis' ':(exclude)examples/test_sync.rs' ':(exclude)docs'  # 必须为空
 git commit ... && git push github public-release:main <tag>
@@ -86,6 +122,20 @@ SQLite 没有 FTS5（实测 `no such module: fts5`），不要再尝试 SQLite F
 - **credits 是原始事实，不是钱**：parquet 保留 `credits` 列并在表格里原样展示。
   它是工具自己上报的消耗量（Qoder 的 token 全被掩码成 0，只有 credits 精确），
   只做记录，不折算货币。
+- **context_ratio 是 Qoder 唯一存活的 token 尺度信号**：Qoder 服务端把所有
+  token 字段掩码成 0（会话 JSONL、runtime 日志、SQLite 云缓存全部如此，模型
+  目录是加密的拿不到上下文窗口大小），但 `usage.context_usage_ratio`（0..=1
+  的上下文窗口占比）是真实值。入库为 `context_ratio` f64（0.0 = 该来源不上报），
+  聚合暴露为各处的 `avg_context_ratio`。**不要**拿假定的窗口大小去乘它换算
+  绝对 token——那是编造数字。掩码来源在排行里以 credits 参与（见 digest 与
+  insights 会话榜的排序），保证 Qoder 不是永远垫底的 0。
+- **Qoder 模型名同理被掩码**（`qmodel`/`qfmodel`/`gmodel`…）。CN 应用的
+  globalStorage（`~/Library/Application Support/QoderCN/User/globalStorage/
+  state.vscdb` 的 `aicoding.modelConfigs.cache.*` 键）以明文 KV 存了官方目录，
+  `qoder.rs` 的 `demask_model()` 内置该映射（qmodel→Qwen3.7-Plus、qfmodel→
+  Qwen3.8-Flash、gmodel→GLM-5.3 等）。目录键以精确匹配走最长键优先，未知键
+  原样透传（新模型、`byok:<uuid>`）。应用侧 `com.qodercn.app.stable/
+  main.sqlite` 有会话标题/真实 cwd/掩码模型名，token 一样全 0，别指望它。
 - **时区**：所有日/周/月分桶与 `timeRange` 过滤一律按 **中国时区（UTC+8）** 切分，
   日界是 00:00 CST，不是 00:00 UTC。parquet 里存的 `timestamp` 仍是真正的 UTC
   epoch 秒，偏移只在读取时施加。唯一入口是 `lib.rs` 的 `CN_OFFSET_SECS` /

@@ -70,6 +70,15 @@ by model family (`claude-sonnet-4-5-…` → `sonnet`); period-over-period diges
 source comparison, model heatmaps (model × source, model × date). Time buckets
 use a fixed UTC+8 offset — no DST surprises.
 
+### 🧠 Deep analysis: how you actually work
+
+One extra tab over the same parquet: an hour-of-day work-rhythm histogram,
+daily cache-efficiency trend (and the raw token volume the cache absorbed),
+a session leaderboard with click-through to the full conversation, and a
+context-fill trend from sources that report it (Qoder's
+`context_usage_ratio` — the one token-scale signal that survives its masking).
+All facts, zero extrapolation.
+
 ### 🔍 A time machine: search everything you ever told an agent
 
 The feature you cannot go back from. A pure-Rust inverted index over
@@ -118,17 +127,43 @@ nothing about you again.
 |---|---|---|
 | Claude Code | `claude` | reads local JSONL session logs |
 | ZCode | `zcode` | |
-| Qoder | `qoder` | token counts masked by host; usage tracked via host-reported credits |
+| Qoder | `qoder` | token counts masked by host; usage tracked via host-reported credits + reported context-window fill |
 | WorkBuddy | `workbuddy` | |
+| MiniMax Code | `minimax` | reads `~/.minimax/v2/sessions/**/messages.jsonl` |
 | OpenCode | `opencode` | |
 | Mimo | `mimo` | |
 | Pi | `pi` | |
 
 ## Quick start
 
-**Apple Silicon:** grab
-`tokenbuddy-v0.4.0-aarch64-apple-darwin.tar.gz` from
+**Apple Silicon / Linux x64** — install script (recommended on macOS; see the
+Gatekeeper note below):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/walker83/TokenBuddy/main/scripts/install.sh | bash
+tokenbuddy
+```
+
+Or grab `tokenbuddy-v0.4.1-aarch64-apple-darwin.tar.gz` from
 [Releases](../../releases), unpack, run.
+
+### macOS says "cannot be opened / not secure"?
+
+The release binary is ad-hoc signed — without a paid Apple Developer ID it
+cannot be notarized, so a tarball **downloaded through a browser** carries a
+quarantine attribute and Gatekeeper blocks it. Two fixes:
+
+```bash
+# a) remove the quarantine flag from the unpacked binary
+xattr -d com.apple.quarantine ./tokenbuddy
+
+# b) or avoid it entirely: the install script downloads via curl,
+#    which never applies the flag
+curl -fsSL https://raw.githubusercontent.com/walker83/TokenBuddy/main/scripts/install.sh | bash
+```
+
+Proper Developer-ID signing + notarization is on the roadmap once an Apple
+Developer account is in play.
 
 **Any other platform, from source** (Rust 1.75+, ~48 s to build):
 
@@ -200,6 +235,7 @@ account, no export target.
 | GET | `/api/heatmap?mode=model_x_source\|model_x_date&metric=` | heatmap matrix |
 | GET | `/api/models` | model comparison table |
 | GET | `/api/digest?days=7` | current vs previous window, top models, per-source split |
+| GET | `/api/insights?limit=20` | deep analysis: hour-of-day rhythm, cache trend, session leaderboard, context fill |
 | GET | `/api/context/search?q=&source=&role=&project=&days=&limit=` | full-text search |
 | GET | `/api/context/session?source=&session_id=&doc_id=&around=` | conversation around a hit |
 | GET | `/api/context/stats` | index build status + corpus figures |
@@ -226,6 +262,7 @@ and `src/dashboard.html` — the whole UI, embedded at compile time.
 ## Roadmap
 
 - [ ] `cargo install` / Homebrew packaging
+- [ ] Developer ID signing + notarization (needs an Apple Developer account)
 - [ ] CI-published prebuilt binaries for Linux / Intel macOS
 - [ ] English UI toggle (dashboard is currently Chinese-first)
 - [ ] More agents: Cursor, Copilot CLI, Windsurf, Gemini CLI, …

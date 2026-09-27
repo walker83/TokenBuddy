@@ -1,16 +1,19 @@
 pub mod claude;
-pub mod opencode;
+pub mod context;
 pub mod mimo;
-pub mod zcode;
+pub mod minimax;
+pub mod opencode;
 pub mod pi;
 pub mod qoder;
-pub mod workbuddy;
 pub mod store;
-pub mod context;
+pub mod workbuddy;
+pub mod zcode;
 
 use chrono::Datelike;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 /// Root data directory: `~/.tokenbuddy`. The historical name was `~/.ltc`;
 /// the one-time rename below carries existing data across the rebrand so an
@@ -108,8 +111,8 @@ pub fn file_mtime(path: &std::path::Path) -> Option<i64> {
 pub fn model_family(model: &str) -> String {
     let m = model.to_lowercase();
     let known: &[&str] = &[
-        "opus", "sonnet", "haiku", "glm", "kimi", "deepseek", "qwen", "gemini",
-        "minimax", "mimo", "grok", "llama", "mistral", "ernie",
+        "opus", "sonnet", "haiku", "glm", "kimi", "deepseek", "qwen", "gemini", "minimax", "mimo",
+        "grok", "llama", "mistral", "ernie",
     ];
     for k in known {
         if m.contains(*k) {
@@ -135,6 +138,10 @@ pub fn model_family(model: &str) -> String {
     }
 }
 
+/// Per-source on-disk cache shared by the collectors: log path → (mtime when
+/// parsed, records). Unchanged files skip re-parsing on the next sync.
+pub(crate) type FileCacheMap = HashMap<String, (SystemTime, Vec<TokenRecord>)>;
+
 #[derive(Debug, Clone)]
 pub struct TokenRecord {
     pub source: Source,
@@ -151,9 +158,15 @@ pub struct TokenRecord {
     /// Time-to-first-token in milliseconds. Only zcode populates this directly.
     pub ttft_ms: Option<u64>,
     /// Spend reported by the tool itself, in its own credit unit. Qoder masks
-    /// token counts but gives exact credits, so cost is derived from this
-    /// rather than the pricing table whenever it is non-zero.
+    /// token counts but gives exact credits, so it is recorded as-is and never
+    /// converted to currency.
     pub credits: f64,
+    /// Fraction of the model context window one request consumed, as reported
+    /// by the source (Qoder's `context_usage_ratio`, a number in 0..=1).
+    /// `0.0` means the source does not report it. For masked sources this is
+    /// the only token-scale signal that survives, so it is recorded raw and
+    /// never multiplied by an assumed window size.
+    pub context_ratio: f64,
     /// Stable id from the source log, used as the sync dedupe key. Sources
     /// whose token counts are masked would otherwise collide on the
     /// timestamp+input_tokens key the other collectors fall back to.
@@ -169,6 +182,7 @@ pub enum Source {
     Pi,
     Qoder,
     WorkBuddy,
+    MiniMax,
 }
 
 impl std::fmt::Display for Source {
@@ -181,6 +195,7 @@ impl std::fmt::Display for Source {
             Source::Pi => "Pi",
             Source::Qoder => "Qoder",
             Source::WorkBuddy => "WorkBuddy",
+            Source::MiniMax => "MiniMax",
         })
     }
 }
@@ -195,6 +210,7 @@ impl Source {
             Source::Pi => "pi",
             Source::Qoder => "qoder",
             Source::WorkBuddy => "workbuddy",
+            Source::MiniMax => "minimax",
         }
     }
 }

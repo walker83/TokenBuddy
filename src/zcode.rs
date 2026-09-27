@@ -107,6 +107,7 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
             duration_ms,
             ttft_ms,
             credits: 0.0,
+            context_ratio: 0.0,
             record_id: Some(id),
         });
     }
@@ -123,7 +124,10 @@ fn get_zcode_db_path() -> PathBuf {
     if let Ok(custom) = std::env::var("ZCODE_CONFIG_DIR") {
         let trimmed = custom.trim();
         if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("cli").join("db").join("db.sqlite");
+            return PathBuf::from(trimmed)
+                .join("cli")
+                .join("db")
+                .join("db.sqlite");
         }
     }
     dirs::home_dir()
