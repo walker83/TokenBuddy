@@ -17,6 +17,10 @@ jobs:
       image: rust:1-bookworm
     steps:
       - uses: actions/checkout@v4
+      # The rust:1 image ships cargo/rustc only — fmt and clippy are opt-in
+      # components, and check.sh's first two gates need both.
+      - name: Install rustfmt + clippy
+        run: rustup component add rustfmt clippy
       - name: Quality gate (fmt + clippy + tests + binary size guard)
         run: scripts/check.sh
       - name: Report binary size
