@@ -176,7 +176,7 @@ curl -fsSL .../install.sh | bash -s -- --service
 ```
 
 或到 [Releases](../../releases) 取
-`tokenbuddy-v0.5.0-aarch64-apple-darwin.tar.gz`，解压即跑。
+`tokenbuddy-v0.5.1-aarch64-apple-darwin.tar.gz`，解压即跑。
 
 ### 命令行
 
@@ -378,7 +378,7 @@ Fleet 上传可开静态加密：在 `fleet.toml` 里写 `encrypt = true`，出�
 | GET | `/api/insights?limit=20` | 深度分析：分时节奏、缓存趋势、会话 Top、上下文水位 |
 | GET | `/api/brief` | statusline 用：今日 + 近 7 天一行小 JSON |
 | GET | `/api/windows?days=28` | 5 小时窗口分段事实 + 28 天 P90 自参考 |
-| GET | `/api/anomalies?days=56` | 日用量异常（工作日分层 median/MAD 稳健 z） |
+| GET | `/api/anomalies` | 日用量异常（工作日分层 median/MAD 稳健 z） |
 | GET | `/api/pivot?days=30` | 项目 × 模型透视 |
 | GET | `/api/context/search?q=&limit=` | 全文搜索；`q` 支持语法 `source: project: role: days: -排除词 "短语"`（语法优先于 URL 参数） |
 | GET | `/api/context/session?source=&session_id=&doc_id=&around=` | 命中处的上下文会话 |

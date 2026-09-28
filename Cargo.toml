@@ -3,7 +3,7 @@ name = "tokenbuddy"
 description = "TokenBuddy — local-first token usage, session analytics and full-text context search for AI coding agents"
 license = "MIT"
 repository = "https://github.com/walker83/TokenBuddy"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 rust-version = "1.75"
 
@@ -48,3 +48,17 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+
+# Issue #1 bug 4: a full release build costs ~4 min on an Android/Termux
+# dev box — too slow for an edit-test loop. `cargo build --profile fast`
+# (opt-level 1, no LTO, incremental, parallel codegen) trades binary size
+# and peak speed for iteration time; tests keep the same semantics.
+# Shipped artifacts and the size gate stay on --release; check.sh is
+# unaffected. The dir is target/fast, so it never mixes with target/release.
+[profile.fast]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 16
+incremental = true
+strip = false

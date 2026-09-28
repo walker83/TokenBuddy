@@ -15,8 +15,13 @@ cargo test --release
 - 短别名 `b` / `r` / `c` 已在 `.cargo/config.toml` 定义，等价于 `--release`。
 - 不要执行 `cargo build` / `cargo test` / `cargo run`（无 `--release` 的形式），
   也不要使用 `--profile dev`。
+- 编辑-测试循环嫌 release 全量慢（Termux 实测首构建 ~4 分钟）？用
+  `cargo build --profile fast` / `cargo test --profile fast`（opt-level 1、
+  无 LTO、增量，产物在 `target/fast`，不与 release 产物混放）。
+  **提交前仍必须过 `scripts/check.sh`（release 口径）**，fast 只用于本地迭代。
 - 服务以 `./target/release/tokenbuddy` 常驻 127.0.0.1:8080，重启前先
-  `pkill -f target/release/tokenbuddy`。
+  `pkill -x tokenbuddy`（按进程名精确匹配——`-f` + 路径匹配会漏掉
+  /usr/bin/tokenbuddy 这类安装位）；然后 `lsof -ti :8080` 确认端口已空。
 - 保持 `target/` 只保留 release 产物；如需深度清理，保留
   `target/release/tokenbuddy` 二进制即可。
 

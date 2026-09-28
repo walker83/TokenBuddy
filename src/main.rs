@@ -277,13 +277,38 @@ fn with_security_headers(mut response: JsonResponse) -> JsonResponse {
 /// literal produces a malformed body that the client reports as an opaque
 /// parse failure, hiding the real cause.
 fn error_response(e: &anyhow::Error) -> JsonResponse {
+    // A caller mistake (bad params) is a 400 — a 500 there reads as "our
+    // server broke", which is wrong and unactionable for API consumers
+    // building watchdogs and bots (issue #1). Param helpers tag their errors
+    // with `BadRequest` in the context chain.
+    let code = if e.chain().any(|c| c.downcast_ref::<BadRequest>().is_some()) {
+        400
+    } else {
+        500
+    };
     let body = serde_json::json!({ "error": e.to_string() }).to_string();
     Response::from_string(body)
         .with_header(
             Header::from_bytes("Content-Type", "application/json")
                 .expect("hardcoded header should be valid"),
         )
-        .with_status_code(500)
+        .with_status_code(code)
+}
+
+/// Marker for caller-caused failures; travels in the anyhow context chain so
+/// route arms can keep a single `Err => error_response` path.
+#[derive(Debug)]
+struct BadRequest;
+
+impl std::fmt::Display for BadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bad request")
+    }
+}
+impl std::error::Error for BadRequest {}
+
+fn client_error(msg: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(BadRequest).context(msg.to_string())
 }
 
 /// Parse a request's query string into decoded key/value pairs.
@@ -293,6 +318,45 @@ fn error_response(e: &anyhow::Error) -> JsonResponse {
 /// WorkBuddy composite `a+b` as `a%2Bb`. Handing the raw text to the
 /// `model LIKE` filter would match nothing for exactly the names users paste
 /// into the box, so values are decoded here.
+/// `GET /api/docs` — the machine-readable API index (issue #1 bug 3: the
+/// endpoint list used to live only in this file's match arms). Keep in step
+/// with the routes below; params shown are the documented ones.
+fn api_endpoints() -> serde_json::Value {
+    let e = |method: &str, path: &str, desc: &str| serde_json::json!({ "method": method, "path": path, "desc": desc });
+    serde_json::json!([
+        e("GET", "/", "仪表盘（单个内嵌 HTML）"),
+        e("GET", "/api/health", "存活探针：不触数据层，看门狗用"),
+        e("GET", "/api/docs", "本索引"),
+        e("POST", "/api/sync?mode=incremental|full", "导入新日志记录，刷新统计"),
+        e("GET", "/api/summary?timeRange=&source=&model=", "总量 + 按来源/模型汇总（timeRange: all|today|7d|30d|90d；不支持 days）"),
+        e("GET", "/api/timeline?timeRange=&mode=daily|hourly|weekly|monthly&source=&model=", "分桶用量（不支持 days）"),
+        e("GET", "/api/metrics?timeRange=&source=&model=", "逐请求指标聚合（耗时/缓存/TTFT）"),
+        e("GET", "/api/heatmap?mode=model_x_source|model_x_date&metric=&timeRange=", "热力图矩阵"),
+        e("GET", "/api/models?timeRange=&source=&model=", "模型对比表"),
+        e("GET", "/api/digest?days=7", "本期 vs 上期（days: 1–365）"),
+        e("GET", "/api/insights?limit=20&timeRange=&source=&model=", "深度分析（limit: 1–100）"),
+        e("GET", "/api/brief", "statusline 用：今日 + 近 7 天一行小 JSON"),
+        e("GET", "/api/windows", "5 小时窗口分段事实 + 28 天 P90 自参考"),
+        e("GET", "/api/anomalies", "日用量异常（审计窗内建 56 天，不接受参数）"),
+        e("GET", "/api/pivot?start=&end=", "项目 × 模型透视（start/end: epoch 秒，可省略）"),
+        e("GET", "/api/context/search?q=&limit=&source=&project=&days=", "全文搜索（limit: 1–100，days: 1–365；q 另支持 source: project: role: days: -排除 \"短语\" 语法）"),
+        e("GET", "/api/context/session?source=&session_id=&doc_id=&around=", "命中处的上下文会话（doc_id 必填）"),
+        e("GET", "/api/context/stats", "索引构建状态 + 语料规模"),
+        e("POST", "/api/context/click?doc_id=", "记录搜索结果点击（排序反馈）"),
+        e("GET", "/api/context/quality", "搜索质量报告"),
+        e("POST", "/api/context/rebuild", "强制全量重建索引"),
+        e("GET", "/api/status", "行数/上次同步/各采集器状态"),
+        e("GET", "/api/fleet/config", "读 Fleet 配置（secret_key 掩码）"),
+        e("POST", "/api/fleet/config", "写 fleet.toml（0600）"),
+        e("POST", "/api/fleet/push", "本地同步后整文件推送到 Fleet bucket"),
+        e("POST", "/api/fleet/pull", "拉取全部主机 parquet（etag 增量）"),
+        e("GET", "/api/fleet/hosts", "Fleet 可用主机列表"),
+        e("GET", "/api/fleet/summary?timeRange=&source=&model=&host=", "Fleet 总账 + 各机明细"),
+        e("GET", "/api/fleet/metrics?…", "按主机分维的耗时/缓存面板"),
+        e("GET", "/api/fleet/models?…", "跨主机的模型对比")
+    ])
+}
+
 fn parse_params(path: &str) -> HashMap<String, String> {
     path.split('?')
         .nth(1)
@@ -306,6 +370,49 @@ fn parse_params(path: &str) -> HashMap<String, String> {
             Some((percent_decode(parts.next()?), percent_decode(parts.next()?)))
         })
         .collect()
+}
+
+/// Strict integer params: "absent" and "malformed" must stay distinct — a
+/// silently-ignored `days=abc` answers a different question than the caller
+/// asked (issue #1) and is invisible from the response. Absent → None;
+/// present but unparseable → 400 via the route's error path.
+fn param_i64(params: &HashMap<String, String>, name: &str) -> Result<Option<i64>> {
+    match params.get(name).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(raw) => raw
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| client_error(format!("参数 {name} 必须是整数，得到 “{raw}”"))),
+    }
+}
+
+fn param_usize(params: &HashMap<String, String>, name: &str) -> Result<Option<usize>> {
+    match params.get(name).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(raw) => raw
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| client_error(format!("参数 {name} 必须是非负整数，得到 “{raw}”"))),
+    }
+}
+
+/// The common `days` window: 1–365, absent → None. Out of range is a caller
+/// mistake (days=0 means "today" in some APIs and "everything" in others),
+/// so it fails loudly instead of clamping to a guess.
+fn days_param(params: &HashMap<String, String>) -> Result<Option<i64>> {
+    match param_i64(params, "days")? {
+        None => Ok(None),
+        Some(d) if (1..=365).contains(&d) => Ok(Some(d)),
+        Some(d) => Err(client_error(format!("参数 days 超出范围（1–365）：{d}"))),
+    }
+}
+
+fn limit_param(params: &HashMap<String, String>, default: usize, max: usize) -> Result<usize> {
+    match param_usize(params, "limit")? {
+        None => Ok(default),
+        Some(l) if (1..=max).contains(&l) => Ok(l),
+        Some(l) => Err(client_error(format!("参数 limit 超出范围（1–{max}）：{l}"))),
+    }
 }
 
 /// Decode `%XX` escapes and turn `+` back into a space, per
@@ -855,13 +962,14 @@ fn serve_one(
         }
         ("GET", path) if path.starts_with("/api/pivot") => {
             let p = parse_params(path);
-            let start = p.get("start").and_then(|v| v.parse::<i64>().ok());
-            let end = p.get("end").and_then(|v| v.parse::<i64>().ok());
-            match store
-                .query_pivot(start, end)
-                .and_then(|pivot| Ok(serde_json::to_string(&pivot)?))
-            {
-                Ok(json) => json_response(json),
+            match param_i64(&p, "start").and_then(|s| param_i64(&p, "end").map(|e| (s, e))) {
+                Ok((start, end)) => match store
+                    .query_pivot(start, end)
+                    .and_then(|pivot| Ok(serde_json::to_string(&pivot)?))
+                {
+                    Ok(json) => json_response(json),
+                    Err(e) => error_response(&e),
+                },
                 Err(e) => error_response(&e),
             }
         }
@@ -887,6 +995,17 @@ fn serve_one(
             Ok(json) => json_response(json),
             Err(e) => error_response(&e),
         },
+        // Watchdog heartbeat: touches neither the store nor the index, so a
+        // wedged data layer still answers here while /api/status would not.
+        ("GET", "/api/health") => json_response(
+            serde_json::json!({
+                "ok": true,
+                "version": env!("CARGO_PKG_VERSION"),
+                "ts": tokenbuddy::now_ts()
+            })
+            .to_string(),
+        ),
+        ("GET", "/api/docs") | ("GET", "/api/") => json_response(api_endpoints().to_string()),
         ("GET", path) if path.starts_with("/api/fleet/hosts") => {
             let hosts = store.fleet_hosts();
             json_response(serde_json::json!({ "hosts": hosts }).to_string())
@@ -910,15 +1029,13 @@ fn serve_one(
             }
         }
         ("POST", path) if path.starts_with("/api/context/click") => {
-            let doc_id = parse_params(path)
-                .get("doc_id")
-                .and_then(|d| d.parse::<i64>().ok());
-            match doc_id {
-                Some(id) => {
+            match param_i64(&parse_params(path), "doc_id") {
+                Ok(Some(id)) => {
                     let n = context.record_click(id);
                     json_response(serde_json::json!({ "doc_id": id, "clicks": n }).to_string())
                 }
-                None => error_response(&anyhow::anyhow!("click 需要 doc_id 参数")),
+                Ok(None) => error_response(&anyhow::anyhow!("click 需要 doc_id 参数")),
+                Err(e) => error_response(&e),
             }
         }
         ("GET", path) if path.starts_with("/api/context/quality") => {
@@ -1485,15 +1602,8 @@ fn handle_context_search(context: &ContextHandle, path: &str) -> Result<String> 
         .map(|s| s.as_str())
         .filter(|s| !s.is_empty() && *s != "all")
         .map(|s| s.to_string());
-    let days = params
-        .get("days")
-        .and_then(|d| d.parse::<i64>().ok())
-        .filter(|d| (1..=365).contains(d));
-    let limit = params
-        .get("limit")
-        .and_then(|l| l.parse::<usize>().ok())
-        .unwrap_or(30)
-        .min(100);
+    let days = days_param(&params)?;
+    let limit = limit_param(&params, 30, 100)?;
 
     let exclude_session = params
         .get("exclude_session")
@@ -1518,14 +1628,9 @@ fn handle_context_session(context: &ContextHandle, path: &str) -> Result<String>
     let params = parse_params(path);
     let source = params.get("source").cloned().unwrap_or_default();
     let session_id = params.get("session_id").cloned().unwrap_or_default();
-    let doc_id: i64 = params
-        .get("doc_id")
-        .and_then(|d| d.parse().ok())
-        .unwrap_or(i64::MIN);
-    let around = params
-        .get("around")
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(10);
+    let doc_id: i64 =
+        param_i64(&params, "doc_id")?.ok_or_else(|| client_error("参数 doc_id 必填（整数）"))?;
+    let around = param_usize(&params, "around")?.unwrap_or(10);
     anyhow::ensure!(
         !source.is_empty() && !session_id.is_empty(),
         "source 与 session_id 必填"
@@ -1564,11 +1669,7 @@ fn handle_metrics(store: &Store, path: &str) -> Result<String> {
 /// context fill trend) in one call.
 fn handle_insights(store: &Store, path: &str) -> Result<String> {
     let f = filters_from(path);
-    let limit = parse_params(path)
-        .get("limit")
-        .and_then(|l| l.parse::<usize>().ok())
-        .filter(|l| (1..=100).contains(l))
-        .unwrap_or(20);
+    let limit = limit_param(&parse_params(path), 20, 100)?;
     let insights = store.query_insights(
         f.source.as_deref(),
         f.model.as_deref(),
@@ -1659,11 +1760,7 @@ fn digest_windows(days: i64) -> (i64, i64, i64) {
 /// digest panel instead of stitching several filtered queries client-side.
 fn handle_digest(store: &Store, path: &str) -> Result<String> {
     let params = parse_params(path);
-    let days: i64 = params
-        .get("days")
-        .and_then(|d| d.parse::<i64>().ok())
-        .filter(|d| (1..=365).contains(d))
-        .unwrap_or(7);
+    let days: i64 = days_param(&params)?.unwrap_or(7);
 
     let (cur_start, now, prev_start) = digest_windows(days);
 
@@ -1761,11 +1858,71 @@ fn handle_digest(store: &Store, path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        client_accepts_zstd, cross_origin_check, digest_windows, host_allowed, mask_secret,
-        origin_allowed, parse_params, percent_decode, read_capped_body, request_has_token,
-        resolve_bind_addr, tokens_equal, MAX_CONFIG_BODY_BYTES,
+        api_endpoints, client_accepts_zstd, cross_origin_check, days_param, digest_windows,
+        host_allowed, limit_param, mask_secret, origin_allowed, param_i64, parse_params,
+        percent_decode, read_capped_body, request_has_token, resolve_bind_addr, tokens_equal,
+        MAX_CONFIG_BODY_BYTES,
     };
     use tiny_http::Header;
+
+    #[test]
+    fn strict_params_reject_garbage_but_keep_absent_optional() {
+        let p = parse_params("/x?days=abc&limit=7");
+        assert!(param_i64(&p, "days").is_err(), "days=abc → 400, not ignore");
+        assert_eq!(param_i64(&p, "limit").unwrap(), Some(7));
+        assert_eq!(param_i64(&p, "missing").unwrap(), None);
+        // Empty value reads as absent (the dashboard sends `x=` for unset).
+        assert_eq!(param_i64(&parse_params("/x?days="), "days").unwrap(), None);
+    }
+
+    #[test]
+    fn window_and_limit_ranges_fail_loudly() {
+        // Issue #1 bug 1: days=abc used to be silently swallowed and the
+        // handler answered a default window — a different question than the
+        // one asked. The guard lives on the params layer the handlers share.
+        let bad = parse_params("/x?days=abc");
+        assert!(days_param(&bad).is_err());
+        let zero = parse_params("/x?days=0");
+        assert!(days_param(&zero).is_err(), "days=0 is a caller mistake");
+        let big = parse_params("/x?days=366");
+        assert!(days_param(&big).is_err());
+        assert_eq!(days_param(&parse_params("/x")).unwrap(), None);
+        assert_eq!(days_param(&parse_params("/x?days=365")).unwrap(), Some(365));
+
+        assert!(limit_param(&parse_params("/x?limit=999"), 20, 100).is_err());
+        assert!(limit_param(&parse_params("/x?limit=abc"), 20, 100).is_err());
+        assert_eq!(limit_param(&parse_params("/x"), 20, 100).unwrap(), 20);
+        assert_eq!(
+            limit_param(&parse_params("/x?limit=1"), 20, 100).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn api_docs_table_covers_the_essential_endpoints() {
+        let docs = api_endpoints();
+        let arr = docs.as_array().expect("docs is an array");
+        assert!(arr.len() >= 25, "endpoint count: {}", arr.len());
+        let paths: Vec<&str> = arr.iter().filter_map(|e| e["path"].as_str()).collect();
+        for must in [
+            "/api/health",
+            "/api/docs",
+            "/api/summary",
+            "/api/context/search",
+            "/api/status",
+        ] {
+            assert!(
+                paths.iter().any(|p| p.split('?').next() == Some(must)),
+                "{must} documented"
+            );
+        }
+        for e in arr {
+            assert!(
+                e["method"].is_string() && e["desc"].is_string(),
+                "shape {e}"
+            );
+        }
+    }
 
     #[test]
     fn masks_the_secret_but_keeps_unset_empty() {

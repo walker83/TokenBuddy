@@ -1,3 +1,8 @@
+---
+name: tokenbuddy-analyze
+description: 查询 TokenBuddy 本地账本与全部 AI 会话历史——"烧了多少 token / 哪个模型 / 缓存命中率""当时 XX 怎么聊的""每日复盘与经验沉淀"。触发词:TokenBuddy、token 用量、会话搜索、复盘、自我进化。
+---
+
 # TokenBuddy Analyze — AI 编程助手的会话数据分析技能
 
 > 把本 skill 装进你的编码 Agent（Claude Code / ZCode / OpenCode 等），它就能
@@ -19,6 +24,12 @@ TokenBuddy 服务在本机运行（默认 `http://127.0.0.1:8080`，只绑定本
 没起就先启动：在 TokenBuddy 仓库目录 `cargo b && ./target/release/tokenbuddy`。
 首次启动后台建索引，搜索就绪前 `/api/context/stats` 会如实报告构建进度。
 
+两条等价通道，数字同源同口径：
+
+- **HTTP API**（本 skill 主体）；
+- **MCP server**：`tokenbuddy mcp`（stdio），一次配置后 summary/timeline/
+  search/health 等以工具形式直接可调，适合长驻 Agent。
+
 ## API 速查（全部 GET，除注明 POST；返回 JSON）
 
 **用量分析**
@@ -31,37 +42,60 @@ TokenBuddy 服务在本机运行（默认 `http://127.0.0.1:8080`，只绑定本
 | `/api/heatmap?mode=model_x_source\|model_x_date&metric=` | 模型热力图 |
 | `/api/models` | 模型对比表 |
 | `/api/digest?days=7` | 本期 vs 上期速览 |
+| `/api/brief` | 今日 + 近 7 天一行小 JSON（statusline 用） |
+| `/api/windows` | 5h 窗口分段 + 28 天 P90 自参考（本地口径，非官方限额） |
+| `/api/anomalies` | 日用量异常（工作日分层稳健 z，审计窗内建 56 天） |
+| `/api/pivot?start=&end=` | 项目 × 模型透视（epoch 秒，可省略） |
 | `POST /api/sync?mode=incremental\|full` | 拉取最新日志（自动刷新索引） |
 
 **上下文搜索（覆盖所有工具的全部历史对话）**
 
 | 端点 | 用途 |
 |---|---|
-| `/api/context/search?q=&source=&role=&project=&days=&limit=` | 全文搜索，q 支持 中/英/混排/前缀 |
+| `/api/context/search?q=&limit=&source=&project=&days=` | 全文搜索 |
 | `/api/context/session?source=&session_id=&doc_id=&around=` | 命中处的上下文会话 |
 | `/api/context/stats` | 索引状态 + 语料规模 |
 | `POST /api/context/rebuild` | 强制全量重建索引 |
 
-`source` 取值：`claude` / `zcode` / `qoder` / `workbuddy` / `opencode` / `mimo` / `pi`。
-搜索响应里 `session_headers` 是命中的会话级摘要，`results[].doc_id` 可直接传给
-session 端点回看原文。
+**元信息**
+
+| 端点 | 用途 |
+|---|---|
+| `/api/health` | 存活探针（不触数据层） |
+| `/api/docs` | 全部端点的机器可读索引——本表的权威来源，拿不准先查它 |
+| `/api/status` | 行数/上次同步/各采集器状态 |
+
+`source` 取值（12 个）：`claude` / `codex` / `gemini` / `qwen` / `zcode` /
+`qoder` / `workbuddy` / `opencode` / `mimo` / `pi` / `minimax` / `hermes`。
+
+**参数校验**：传错参数返回 **400** + 具体原因（如 `days=abc` → "参数 days
+必须是整数"），`days` 合法域 1–365、`limit` 1–100；未知参数忽略。
+
+**搜索查询语法**（写在 `q` 里，优先于 URL 参数）：
+
+- `source:zcode` `project:目录名` `role:user` `days:7` — 字段过滤
+- `-排除词` — 排除；`"精确短语"` — 短语匹配
+- 中/英/混排均可，无需词典；响应里 `session_headers` 是会话级摘要，
+  `results[].doc_id` 可直接传给 session 端点回看原文
 
 ## 分析套路
 
 **Token 复盘（回答"钱烧哪了"）**
 1. `/api/digest?days=7` 拿本期 vs 上期总量；
 2. `/api/summary` + `/api/models` 看来源与模型分布，指出最大头；
-3. `/api/heatmap?mode=model_x_source` 找出"高频但低价值"的组合；
+3. `/api/pivot` 看"哪个项目在烧"，`/api/heatmap?mode=model_x_source` 找
+   高频低价值组合；
 4. 结论按"砍掉什么 / 换什么模型 / 保持什么"三段输出。
 
 **找回历史讨论（回答"当时怎么聊的"）**
-1. 用 2-4 个关键中/英文词 `/api/context/search`；
+1. 用 2-4 个关键中/英文词 `/api/context/search`（可叠加 `project:` `days:`）；
 2. 挑最相关的 1-3 条 `doc_id` 调 `/api/context/session` 展开前后文；
 3. 汇总：问题是什么、当时的结论、在哪个工程哪个会话。
 
 **每日自我进化（喂给 Agent 自己做复盘）**
-1. `/api/timeline?mode=daily` 看当天量级，`/api/context/search` 按"当天 + 当前
-   项目名"过滤近几天的用户消息；
+1. `tokenbuddy report --days 1`（或 `/api/brief` + `/api/timeline?mode=daily`）
+   看当天量级，`/api/context/search` 按"当天 + 当前项目名"过滤近几天的
+   用户消息；
 2. 归纳：今天做了什么、哪些流程重复出现（3 次以上 = skill/规则候选）、
    哪些报错反复（= 工程改进候选）；
 3. 产出一份"经验教训 + skill 候选 + 工程改进"三节报告。
@@ -69,5 +103,6 @@ session 端点回看原文。
 ## 注意
 
 - 一切数据都在本机；不要把会话内容发给外部服务。
-- 时间分桶是固定 UTC+8；`days` 参数按天回看。
+- 时间分桶固定 UTC+8；货币成本不估算，credits 原样透传。
 - 搜索索引在每次 sync 后自动增量刷新，无需手动重建。
+- 端点/参数以 `/api/docs` 实时返回为准（本表可能滞后于服务版本）。

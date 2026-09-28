@@ -207,7 +207,7 @@ a terminal to keep open:
 curl -fsSL .../install.sh | bash -s -- --service
 ```
 
-Or grab `tokenbuddy-v0.5.0-aarch64-apple-darwin.tar.gz` from
+Or grab `tokenbuddy-v0.5.1-aarch64-apple-darwin.tar.gz` from
 [Releases](../../releases), unpack, run.
 
 ### Command line
@@ -430,7 +430,7 @@ authentication tag instead of yielding garbage.
 | GET | `/api/insights?limit=20` | deep analysis: hour-of-day rhythm, cache trend, session leaderboard, context fill |
 | GET | `/api/brief` | statusline feed: today + trailing 7 days as one small JSON |
 | GET | `/api/windows?days=28` | 5-hour window segments + a self-referenced 28-day P90 |
-| GET | `/api/anomalies?days=56` | daily-usage anomalies (weekday-stratified median/MAD robust z) |
+| GET | `/api/anomalies` | daily-usage anomalies (weekday-stratified median/MAD robust z) |
 | GET | `/api/pivot?days=30` | project × model pivot |
 | GET | `/api/context/search?q=&limit=` | full-text search; `q` accepts `source: project: role: days: -excluded "phrase"` syntax (overrides URL params) |
 | GET | `/api/context/session?source=&session_id=&doc_id=&around=` | conversation around a hit |
