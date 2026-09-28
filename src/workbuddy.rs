@@ -22,6 +22,25 @@ use std::time::SystemTime;
 
 static FILE_CACHE: Mutex<Option<FileCacheMap>> = Mutex::new(None);
 
+/// Drop the resident parse cache. The cache only exists to make a *second*
+/// sync cheaper than the first; left in place it pins every record of every
+/// session log in the heap for the life of the process, growing with total
+/// history and eating the resident-memory budget the dashboard is measured
+/// against. `store::sync` calls this once the parquet has been written, so
+/// the saving is paid back only by whoever asks for the next sync.
+pub fn release_caches() {
+    let mut cache = FILE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *cache = None;
+}
+
+/// Where this collector reads from, when that place exists on this machine.
+/// Powers the dashboard's source-health panel and the first-run prompt, so a
+/// user with a missing or unmoved tool directory is told which one instead of
+/// just seeing zeros.
+pub fn log_path() -> Option<std::path::PathBuf> {
+    log_paths().into_iter().find(|p| p.exists())
+}
+
 pub fn collect_records() -> Result<Vec<TokenRecord>> {
     let traces_dir = get_workbuddy_dir().join("traces");
     if !traces_dir.exists() {
@@ -62,6 +81,12 @@ pub fn collect_records() -> Result<Vec<TokenRecord>> {
     cache_map.retain(|path, _| current_paths.contains(path));
 
     Ok(all_records)
+}
+
+/// Candidate log locations, for `tokenbuddy doctor`: presence is optional,
+/// the doctor reports what exists and what does not.
+pub fn log_paths() -> Vec<PathBuf> {
+    vec![get_workbuddy_dir().join("traces")]
 }
 
 fn get_workbuddy_dir() -> PathBuf {
@@ -176,11 +201,13 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
             .get("sessionId")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        project: String::new(),
         duration_ms: trace.get("duration").and_then(|v| v.as_u64()),
         ttft_ms: None,
         credits: 0.0,
         context_ratio: 0.0,
         record_id,
+        merge_key: None,
     }])
 }
 

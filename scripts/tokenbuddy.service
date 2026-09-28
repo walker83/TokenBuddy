@@ -1,0 +1,33 @@
+# TokenBuddy as a systemd user service (Linux).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/tokenbuddy.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now tokenbuddy.service
+#
+# Check / logs:
+#   systemctl --user status tokenbuddy
+#   journalctl --user -u tokenbuddy -f
+#
+# Survive logout: `loginctl enable-linger $USER`
+#
+# The unit lives in ~/.config/systemd/user rather than /etc/systemd/system on
+# purpose: it needs no root, and a per-user service is the right scope for a
+# dashboard that reads one user's session logs and binds one user's localhost.
+
+[Unit]
+Description=TokenBuddy — local token dashboard for AI coding agents
+Documentation=https://github.com/walker83/TokenBuddy
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/tokenbuddy serve --port 8080
+# No terminal means nobody is watching: never pop a browser on restart.
+Environment=TOKENBUDDY_NO_OPEN=1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

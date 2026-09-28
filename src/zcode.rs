@@ -6,6 +6,25 @@ use std::time::SystemTime;
 
 static SQLITE_CACHE: Mutex<Option<(SystemTime, Vec<TokenRecord>)>> = Mutex::new(None);
 
+/// Drop the resident parse cache. The cache only exists to make a *second*
+/// sync cheaper than the first; left in place it pins every record of every
+/// session log in the heap for the life of the process, growing with total
+/// history and eating the resident-memory budget the dashboard is measured
+/// against. `store::sync` calls this once the parquet has been written, so
+/// the saving is paid back only by whoever asks for the next sync.
+pub fn release_caches() {
+    let mut cache = SQLITE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *cache = None;
+}
+
+/// Where this collector reads from, when that place exists on this machine.
+/// Powers the dashboard's source-health panel and the first-run prompt, so a
+/// user with a missing or unmoved tool directory is told which one instead of
+/// just seeing zeros.
+pub fn log_path() -> Option<std::path::PathBuf> {
+    log_paths().into_iter().find(|p| p.exists())
+}
+
 pub fn collect_records() -> Result<Vec<TokenRecord>> {
     let db_path = get_zcode_db_path();
     if !db_path.exists() {
@@ -35,16 +54,23 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
     // checkpointed. We only issue SELECTs so this is safe.
     let conn = rusqlite::Connection::open(db_path)?;
 
+    // A tool that is mid-write holds an exclusive lock on its own database.
+    // Without a busy timeout the SELECT fails instantly with SQLITE_BUSY —
+    // and before sync became per-collector fault-tolerant, that single
+    // locked database voided every other source's import as well.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+
     // model_usage row id is unique — keep only completed rows so we don't
     // double-count in-flight or retried requests.
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, model_id, started_at, completed_at,
-                input_tokens, output_tokens, reasoning_tokens,
-                cache_creation_input_tokens, cache_read_input_tokens,
-                duration_ms, time_to_first_token_ms
-         FROM model_usage
-         WHERE status='completed'
-         ORDER BY COALESCE(completed_at, started_at) ASC",
+        "SELECT m.id, m.session_id, m.model_id, m.started_at, m.completed_at,
+                m.input_tokens, m.output_tokens, m.reasoning_tokens,
+                m.cache_creation_input_tokens, m.cache_read_input_tokens,
+                m.duration_ms, m.time_to_first_token_ms, s.directory
+         FROM model_usage m
+         JOIN session s ON s.id = m.session_id
+         WHERE m.status='completed'
+         ORDER BY COALESCE(m.completed_at, m.started_at) ASC",
     )?;
 
     let mut records = Vec::new();
@@ -63,6 +89,7 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
         let cache_read_input_tokens: i64 = row.get(9)?;
         let duration_ms_raw: Option<i64> = row.get(10).ok();
         let ttft_ms_raw: Option<i64> = row.get(11).ok();
+        let directory: Option<String> = row.get(12).ok();
 
         if input_tokens == 0
             && output_tokens == 0
@@ -104,11 +131,13 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
             cache_creation_tokens: cache_creation_input_tokens.max(0) as u64,
             timestamp: timestamp_secs,
             session_id: Some(session_id),
+            project: directory.unwrap_or_default(),
             duration_ms,
             ttft_ms,
             credits: 0.0,
             context_ratio: 0.0,
             record_id: Some(id),
+            merge_key: None,
         });
     }
 
@@ -118,6 +147,12 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
 // Storage location for context search; see `context.rs`.
 pub(crate) fn db_path() -> PathBuf {
     get_zcode_db_path()
+}
+
+/// Candidate log locations, for `tokenbuddy doctor`: presence is optional,
+/// the doctor reports what exists and what does not.
+pub fn log_paths() -> Vec<PathBuf> {
+    vec![get_zcode_db_path()]
 }
 
 fn get_zcode_db_path() -> PathBuf {

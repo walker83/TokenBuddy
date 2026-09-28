@@ -23,6 +23,25 @@ use std::time::SystemTime;
 
 static FILE_CACHE: Mutex<Option<FileCacheMap>> = Mutex::new(None);
 
+/// Drop the resident parse cache. The cache only exists to make a *second*
+/// sync cheaper than the first; left in place it pins every record of every
+/// session log in the heap for the life of the process, growing with total
+/// history and eating the resident-memory budget the dashboard is measured
+/// against. `store::sync` calls this once the parquet has been written, so
+/// the saving is paid back only by whoever asks for the next sync.
+pub fn release_caches() {
+    let mut cache = FILE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *cache = None;
+}
+
+/// Where this collector reads from, when that place exists on this machine.
+/// Powers the dashboard's source-health panel and the first-run prompt, so a
+/// user with a missing or unmoved tool directory is told which one instead of
+/// just seeing zeros.
+pub fn log_path() -> Option<std::path::PathBuf> {
+    get_qoder_homes().into_iter().next()
+}
+
 pub fn collect_records() -> Result<Vec<TokenRecord>> {
     let homes = get_qoder_homes();
     if homes.is_empty() {
@@ -74,6 +93,14 @@ pub fn collect_records() -> Result<Vec<TokenRecord>> {
     }
 
     Ok(all_records)
+}
+
+/// Candidate roots (CN and international builds), for `tokenbuddy doctor`.
+pub fn log_paths() -> Vec<PathBuf> {
+    match dirs::home_dir() {
+        Some(home) => vec![home.join(".qoder-cn"), home.join(".qoder")],
+        None => vec![],
+    }
 }
 
 fn get_qoder_homes() -> Vec<PathBuf> {
@@ -393,6 +420,7 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            project: String::new(),
             duration_ms: None,
             ttft_ms: None,
             credits,
@@ -400,6 +428,7 @@ fn parse_single_file(file_path: &Path) -> Result<Vec<TokenRecord>> {
             // The request id doubles as the dedupe key and the join key back to
             // the runtime log's per-turn duration.
             record_id: request_id,
+            merge_key: None,
         });
     }
 

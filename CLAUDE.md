@@ -24,8 +24,9 @@ cargo test --release
 
 单一入口是 `scripts/check.sh`：`cargo fmt --check` → `clippy --release
 --all-targets -D warnings` → `cargo test --release` → release 构建后检查二进制
-体积（默认上限 8 MB，`TOKENBUDDY_SIZE_LIMIT_MB` 可调；README 主打 4.1 MB，
-上限放宽到 2 倍只为拦住"拖进重依赖"级别的事故，如当年 DuckDB +19 MB）。
+体积（默认上限 20 MB，2026-09-28 从 8 MB 放宽，`TOKENBUDDY_SIZE_LIMIT_MB`
+可调；上限的存在只为拦住"拖进重依赖"级别的事故，如当年 DuckDB +19 MB，
+接近上限时仍应主动做 bloat 排查）。
 
 三道闸共用这一个脚本，改检查只改这里：
 

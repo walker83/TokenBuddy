@@ -27,6 +27,25 @@ use std::time::SystemTime;
 
 static FILE_CACHE: Mutex<Option<FileCacheMap>> = Mutex::new(None);
 
+/// Drop the resident parse cache. The cache only exists to make a *second*
+/// sync cheaper than the first; left in place it pins every record of every
+/// session log in the heap for the life of the process, growing with total
+/// history and eating the resident-memory budget the dashboard is measured
+/// against. `store::sync` calls this once the parquet has been written, so
+/// the saving is paid back only by whoever asks for the next sync.
+pub fn release_caches() {
+    let mut cache = FILE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *cache = None;
+}
+
+/// Where this collector reads from, when that place exists on this machine.
+/// Powers the dashboard's source-health panel and the first-run prompt, so a
+/// user with a missing or unmoved tool directory is told which one instead of
+/// just seeing zeros.
+pub fn log_path() -> Option<std::path::PathBuf> {
+    log_paths().into_iter().find(|p| p.exists())
+}
+
 pub fn collect_records() -> Result<Vec<TokenRecord>> {
     let session_files = collect_message_files(&sessions_dir());
 
@@ -62,6 +81,12 @@ pub fn collect_records() -> Result<Vec<TokenRecord>> {
     cache_map.retain(|path, _| current_paths.contains(path));
 
     Ok(all_records)
+}
+
+/// Candidate log locations, for `tokenbuddy doctor`: presence is optional,
+/// the doctor reports what exists and what does not.
+pub fn log_paths() -> Vec<PathBuf> {
+    vec![sessions_dir()]
 }
 
 fn sessions_dir() -> PathBuf {
@@ -175,6 +200,7 @@ fn parse_usage_records(messages_path: &Path) -> Result<Vec<TokenRecord>> {
             cache_creation_tokens: cache_write,
             timestamp,
             session_id: Some(session_id.clone()),
+            project: String::new(),
             // The log carries one completion timestamp per call, not a span.
             duration_ms: None,
             ttft_ms: None,
@@ -184,6 +210,7 @@ fn parse_usage_records(messages_path: &Path) -> Result<Vec<TokenRecord>> {
                 .get("responseId")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            merge_key: None,
         });
     }
 

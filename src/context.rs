@@ -24,7 +24,7 @@
 //! sync; the parquet file is the durable state, so a restart just re-reads
 //! it.
 
-use crate::{claude, mimo, minimax, opencode, pi, qoder, workbuddy, zcode, Source};
+use crate::{claude, hermes, mimo, minimax, opencode, pi, qoder, workbuddy, zcode, Source};
 use anyhow::Result;
 use arrow::array::{
     Array, BooleanArray, BooleanBuilder, Int64Array, Int64Builder, RecordBatch, StringBuilder,
@@ -469,6 +469,19 @@ fn parquet_is_current_schema(path: &Path) -> bool {
     }
 }
 
+/// Run one collector's drain with a panic guard.
+///
+/// The drainers return nothing, so a malformed log surfaces as a panic rather
+/// than an `Err`. Left unguarded, one bad file in one tool's history took the
+/// whole index down with it and the search box went permanently empty — a
+/// failure the user could neither see nor work around. Catching per source
+/// keeps the other seven sources searchable and prints which one gave up.
+fn drain_guarded<F: FnOnce()>(name: &str, f: F) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+        eprintln!("[TokenBuddy] context collection failed for {name}; other sources kept");
+    }
+}
+
 /// Collect from every source, dedupe against `path`, and append the new docs.
 /// `clear` rebuilds from scratch (the caller owns snapshotting, mirroring
 /// Incremental collect+dedupe over the live sources, one source at a time:
@@ -479,14 +492,21 @@ pub fn sync_context(path: &Path, clear: bool) -> Result<SyncStats> {
     let mut sink = SyncSink::open(path, clear)?;
     {
         let mut push = |m: ContextMessage| sink.absorb_one(m);
-        claude::drain_messages(&mut push);
-        drain_lineage(Source::Zcode, &zcode::db_path(), &mut push);
-        drain_lineage(Source::OpenCode, &opencode::db_path(), &mut push);
-        drain_lineage(Source::Mimo, &mimo::db_path(), &mut push);
-        pi::drain_messages(&mut push);
-        qoder::drain_messages(&mut push);
-        workbuddy::drain_messages(&mut push);
-        minimax::drain_messages(&mut push);
+        drain_guarded("claude", || claude::drain_messages(&mut push));
+        drain_guarded("zcode", || {
+            drain_lineage(Source::Zcode, &zcode::db_path(), &mut push)
+        });
+        drain_guarded("opencode", || {
+            drain_lineage(Source::OpenCode, &opencode::db_path(), &mut push)
+        });
+        drain_guarded("mimo", || {
+            drain_lineage(Source::Mimo, &mimo::db_path(), &mut push)
+        });
+        drain_guarded("pi", || pi::drain_messages(&mut push));
+        drain_guarded("qoder", || qoder::drain_messages(&mut push));
+        drain_guarded("workbuddy", || workbuddy::drain_messages(&mut push));
+        drain_guarded("minimax", || minimax::drain_messages(&mut push));
+        drain_guarded("hermes", || hermes::drain_messages(&mut push));
     }
     sink.finish(path)
 }
@@ -1098,7 +1118,33 @@ impl ContextIndex {
         // MAX_INDEX_DOCS cap.
         let mut pass1_docs = 0usize;
 
-        if path.exists() {
+        // R5: a context.parquet that cannot be opened is moved aside instead
+        // of failing every build — it is derived data, fully re-collectable
+        // from the source logs via a rebuild.
+        let corrupt = path.exists()
+            && std::fs::File::open(path)
+                .and_then(|f| {
+                    ParquetRecordBatchReaderBuilder::try_new(f)
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                })
+                .is_err();
+        if corrupt {
+            let aside = path.with_file_name(format!(
+                "context.corrupt-{}.parquet",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            ));
+            match std::fs::rename(path, &aside) {
+                Ok(()) => eprintln!(
+                    "[TokenBuddy] context.parquet 无法读取——已移至 {};重建索引将重新采集对话",
+                    aside.display()
+                ),
+                Err(re) => eprintln!("[TokenBuddy] context.parquet 无法读取且移不开({re})"),
+            }
+        }
+        if path.exists() && !corrupt {
             // ---- Pass 1: term sizes, session stats, digests, interning ----
             let file = std::fs::File::open(path)?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
@@ -1677,6 +1723,27 @@ impl ContextIndex {
             };
         }
 
+        // R21: pull field filters and exclusions out of the query text; what
+        // remains is what the tokenizer sees. Syntax overrides URL params.
+        let parsed_query = parse_query_syntax(trimmed);
+        let merged = SearchFilter {
+            source: parsed_query.source.as_deref().or(filter.source),
+            role: parsed_query.role.as_deref().or(filter.role),
+            project: parsed_query.project.as_deref().or(filter.project),
+            since: parsed_query
+                .days
+                .map(|d| crate::now_ts() - d * 86_400)
+                .or(filter.since),
+            limit: filter.limit,
+            exclude_sessions: filter.exclude_sessions,
+        };
+        let filter = &merged;
+        let trimmed = if parsed_query.free_text.is_empty() {
+            trimmed
+        } else {
+            &parsed_query.free_text
+        };
+
         let t_terms = Instant::now();
         let terms = self.query_terms(trimmed);
         let terms_us = t_terms.elapsed().as_micros() as u64;
@@ -1712,11 +1779,34 @@ impl ContextIndex {
         let mut candidates = 0usize;
 
         let t_verify = Instant::now();
+        // R21: normalized `-word` needles; `contains(slice)` is a single
+        // pass over the haystack for all of them.
+        let exclusion_needles: Vec<String> = parsed_query
+            .excluded
+            .iter()
+            .map(|w| normalize(w))
+            .filter(|w| !w.is_empty())
+            .collect();
         // Filters resolve to interned ids once, so the per-candidate checks
-        // below are integer comparisons.
-        let src_filter = filter
-            .source
-            .and_then(|s| self.source_names.iter().position(|x| x.as_ref() == s));
+        // below are integer comparisons. A source absent from the interning
+        // table matches zero docs — an early empty, not a dropped filter.
+        let src_filter = match filter.source {
+            None => None,
+            Some(s) => match self.source_names.iter().position(|x| x.as_ref() == s) {
+                Some(p) => Some(p),
+                None => {
+                    return SearchResponse {
+                        query: trimmed.to_string(),
+                        elapsed_ms: t0.elapsed().as_millis() as u64,
+                        candidates: 0,
+                        results: vec![],
+                        terms: vec![],
+                        session_headers: vec![],
+                        trace: SearchTrace::default(),
+                    };
+                }
+            },
+        };
         let role_filter = filter.role.map(|r| {
             if r == "user" {
                 ROLE_USER
@@ -1787,6 +1877,14 @@ impl ContextIndex {
                 }
             }
             if !matched_any {
+                continue;
+            }
+            // R21: `-word` exclusions — the text is already decompressed
+            // here, so the check is free at this point.
+            if exclusion_needles
+                .iter()
+                .any(|needle| lower.contains(needle.as_str()))
+            {
                 continue;
             }
 
@@ -2194,6 +2292,73 @@ pub struct SearchTrace {
     pub total_ms: u64,
 }
 
+/// R21 — query syntax, parsed once and merged into the filter the search
+/// already speaks:
+///
+/// * `source:claude`, `project:foo`, `role:user`, `days:7` — field filters
+///   (they override the URL parameters when both are present);
+/// * `-word` — results containing the word (normalized substring) drop out;
+/// * bare quotes on a free token are stripped; phrase matching itself rides
+///   the existing verbatim-substring verification.
+///
+/// Unknown `key:value` tokens stay in the free text: a user searching for
+/// e.g. a literal URL with a colon must not lose it to the parser.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParsedQuery {
+    pub free_text: String,
+    pub source: Option<String>,
+    pub project: Option<String>,
+    pub role: Option<String>,
+    pub days: Option<i64>,
+    pub excluded: Vec<String>,
+}
+
+pub fn parse_query_syntax(query: &str) -> ParsedQuery {
+    let mut parsed = ParsedQuery::default();
+    let mut free: Vec<&str> = Vec::new();
+    for token in query.split_whitespace() {
+        if let Some((key, value)) = token.split_once(':') {
+            if !value.is_empty() {
+                match key {
+                    "source" => {
+                        parsed.source = Some(value.to_string());
+                        continue;
+                    }
+                    "project" => {
+                        parsed.project = Some(value.to_string());
+                        continue;
+                    }
+                    "role" => {
+                        parsed.role = Some(value.to_string());
+                        continue;
+                    }
+                    "days" => {
+                        if let Ok(n) = value.parse::<i64>() {
+                            if n > 0 {
+                                parsed.days = Some(n);
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(rest) = token.strip_prefix('-') {
+            if !rest.is_empty() && !rest.contains(':') {
+                parsed.excluded.push(rest.to_string());
+                continue;
+            }
+        }
+        let bare = token.trim_matches('"');
+        if !bare.is_empty() {
+            free.push(bare);
+        }
+    }
+    parsed.free_text = free.join(" ");
+    parsed
+}
+
 #[derive(Default)]
 pub struct SearchFilter<'a> {
     pub source: Option<&'a str>,
@@ -2266,7 +2431,20 @@ pub struct ContextHandle {
 struct Inner {
     index: Option<Arc<ContextIndex>>,
     status: ContextStatus,
+    /// The corpus on disk has grown since this index was built. The index is
+    /// still served — it is a subset, not a lie — but the next search rebuilds.
+    stale: bool,
+    /// Epoch seconds of the last search that actually touched the index. Drives
+    /// the idle unload that hands the memory back.
+    last_used: i64,
 }
+
+/// How long the search index may sit unused before it is dropped, in seconds.
+///
+/// Long enough that a person reading the dashboard all afternoon never notices
+/// (and never pays to rebuild), short enough that closing the laptop lid
+/// eventually returns the memory instead of pinning it until restart.
+const IDLE_UNLOAD_SECS: i64 = 15 * 60;
 
 /// Rotate the search log once it passes this size; the previous generation
 /// moves to `.jsonl.1`, so a burst of queries never loses everything.
@@ -2323,6 +2501,8 @@ impl ContextHandle {
                     detail: None,
                     last_sync: None,
                 },
+                stale: false,
+                last_used: 0,
             }),
             build_lock: Mutex::new(()),
         }
@@ -2424,6 +2604,88 @@ impl ContextHandle {
         inner.status.detail = detail;
     }
 
+    /// Record that the index was actually read, so the idle unload knows.
+    fn mark_used(&self) {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        inner.last_used = crate::now_ts();
+    }
+
+    /// Is the loaded index safe to serve without rebuilding?
+    fn index_usable(&self) -> bool {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner.index.is_some() && !inner.stale
+    }
+
+    /// Guarantee a usable index, building it if this is the first search of
+    /// the session (or the corpus moved on since the last build). Blocking on
+    /// purpose: the caller asked to search, and a few seconds of build is a far
+    /// better answer than an empty result set.
+    pub fn ensure_index(&self) -> Result<()> {
+        if self.index_usable() {
+            self.mark_used();
+            return Ok(());
+        }
+        // `sync_and_build` takes the build lock itself and re-checks staleness
+        // under it, so two racing first searches cost one build, not two.
+        self.sync_and_build(false)?;
+        self.mark_used();
+        Ok(())
+    }
+
+    /// Start a build in the background if one is needed, and return at once.
+    ///
+    /// Called when the user opens the search view: by the time they finish
+    /// typing a query the index is usually already there, and a user who only
+    /// ever looks at statistics never triggers it at all.
+    pub fn warm_if_needed(self: &Arc<Self>) {
+        if self.index_usable() {
+            return;
+        }
+        let me = Arc::clone(self);
+        std::thread::spawn(move || {
+            if let Err(e) = me.ensure_index() {
+                eprintln!("[TokenBuddy] context warm-up failed: {e}");
+            }
+        });
+    }
+
+    /// Hand the index memory back if nobody has searched for a while.
+    ///
+    /// Driven by a timer in `main`, so an idle dashboard returns to its
+    /// statistics-only footprint without the user having to restart anything.
+    /// The parquet is untouched: the next search rebuilds from it.
+    pub fn unload_if_idle(&self) -> bool {
+        self.unload_if_idle_after(IDLE_UNLOAD_SECS)
+    }
+
+    /// [`Self::unload_if_idle`] with the threshold supplied, so the lifecycle
+    /// can be tested without waiting out a real idle window.
+    pub fn unload_if_idle_after(&self, idle_secs: i64) -> bool {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let Some(_) = inner.index.as_ref() else {
+            return false;
+        };
+        if inner.last_used == 0 || crate::now_ts() - inner.last_used < idle_secs {
+            return false;
+        }
+        if matches!(inner.status.phase, Phase::Syncing | Phase::Building) {
+            return false;
+        }
+        let docs = inner
+            .index
+            .as_ref()
+            .map(|i| i.stats().docs)
+            .unwrap_or_default();
+        inner.index = None;
+        inner.stale = false;
+        inner.status.phase = Phase::Empty;
+        inner.status.detail = None;
+        eprintln!(
+            "[TokenBuddy] context index idle for {IDLE_UNLOAD_SECS}s, unloaded ({docs} docs)"
+        );
+        true
+    }
+
     /// Incremental collect+dedupe of conversations, then rebuild the index
     /// and swap it in. `clear` drops the stored parquet first (full rebuild).
     pub fn sync_and_build(&self, clear: bool) -> Result<SyncStats> {
@@ -2445,6 +2707,20 @@ impl ContextHandle {
                 return Err(e);
             }
         };
+        // Nothing new was collected, so the index on disk already describes the
+        // corpus exactly. Rebuilding it would be a full two-pass pass over every
+        // turn to produce the same bytes — and the build is the one phase whose
+        // transient allocations set the process high-water mark, which the OS
+        // then keeps. Skipping it is what stops a run of syncs (a dashboard
+        // refresh button is easy to hold down) from walking the footprint up.
+        if !clear && stats.imported == 0 && self.index_is_loaded() {
+            let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            inner.status.last_sync = Some(stats.clone());
+            inner.status.phase = Phase::Ready;
+            inner.status.detail = None;
+            inner.stale = false;
+            return Ok(stats);
+        }
         self.set_phase(Phase::Building, None);
         {
             // Drop the old index before building the replacement: the OS does
@@ -2461,6 +2737,8 @@ impl ContextHandle {
                 inner.status.last_sync = Some(stats.clone());
                 inner.status.phase = Phase::Ready;
                 inner.status.detail = None;
+                inner.stale = false;
+                inner.last_used = crate::now_ts();
                 Ok(stats)
             }
             Err(e) => {
@@ -2478,6 +2756,17 @@ impl ContextHandle {
             .clone()
     }
 
+    /// Whether a searchable index is currently loaded. An index that failed to
+    /// build is not "loaded" even though the corpus is unchanged, so the
+    /// no-op-sync shortcut must not strand the user with an empty search box.
+    fn index_is_loaded(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .index
+            .is_some()
+    }
+
     pub fn index_stats(&self) -> Option<IndexStats> {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.index.as_ref().map(|i| i.stats().clone())
@@ -2492,6 +2781,8 @@ impl ContextHandle {
         anchor_doc_id: i64,
         around: usize,
     ) -> Result<SessionContext> {
+        // Expanding a hit is a search action: the index has to be there.
+        self.ensure_index()?;
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let Some(index) = &inner.index else {
             anyhow::bail!("上下文索引尚未就绪（{}）", inner.status.phase_desc());
@@ -2502,6 +2793,9 @@ impl ContextHandle {
     }
 
     pub fn search(&self, query: &str, filter: &SearchFilter) -> Result<SearchResponse> {
+        // First search of the session pays for the build; after that this is a
+        // couple of atomic reads on an already-usable index.
+        self.ensure_index()?;
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let Some(index) = &inner.index else {
             anyhow::bail!("上下文索引尚未就绪（{}）", inner.status.phase_desc());
@@ -3025,6 +3319,74 @@ mod search_regression {
         (ContextIndex::build(&path).unwrap(), dir)
     }
 
+    /// Lazy building only pays off if the index really does leave. Pin the
+    /// whole lifecycle: build → not idle → unload → corpus intact → rebuild
+    /// on demand. A regression that keeps the index resident is exactly the
+    /// memory growth this design exists to prevent.
+    #[test]
+    fn index_is_built_on_demand_and_unloaded_when_idle() {
+        let dir =
+            std::env::temp_dir().join(format!("tokenbuddy_ctx_lifecycle_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("context.parquet");
+
+        let handle = ContextHandle::new(path.clone());
+        // Nothing is built until something asks — a reader of statistics never
+        // pays for the index at all.
+        assert!(handle.index_stats().is_none(), "index must not exist yet");
+        assert!(!handle.unload_if_idle_after(0), "nothing to unload");
+
+        let rows = (0..4)
+            .map(|i| {
+                (
+                    (i + 1) as i64,
+                    ContextMessage {
+                        source: Source::Zcode,
+                        session_id: format!("s{i}"),
+                        role: if i % 2 == 0 { "user" } else { "assistant" },
+                        timestamp: 1_700_000_000 + i as i64,
+                        text: format!("生命周期测试第 {i} 条"),
+                        project: String::new(),
+                        title: String::new(),
+                    },
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        write_context_parquet(&path, &docs_to_batch(&rows)).unwrap();
+
+        // The corpus exists on disk but is still not loaded.
+        assert!(handle.index_stats().is_none());
+
+        // The first search is what builds it.
+        handle.ensure_index().unwrap();
+        assert!(handle.index_stats().is_some());
+        assert!(!handle
+            .search("生命周期", &SearchFilter::default())
+            .unwrap()
+            .results
+            .is_empty());
+
+        // Freshly used: the idle timer must not fire.
+        assert!(!handle.unload_if_idle_after(IDLE_UNLOAD_SECS));
+
+        // Idle past the threshold: the heap goes back, the parquet does not.
+        assert!(handle.unload_if_idle_after(0));
+        assert!(handle.index_stats().is_none());
+        assert!(path.exists(), "the corpus must survive the unload");
+
+        // And the next search simply rebuilds it.
+        assert!(!handle
+            .search("生命周期", &SearchFilter::default())
+            .unwrap()
+            .results
+            .is_empty());
+        assert!(handle.index_stats().is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn search(index: &ContextIndex, q: &str) -> SearchResponse {
         index.search(
             q,
@@ -3033,6 +3395,90 @@ mod search_regression {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn query_syntax_parse_extracts_fields_exclusions_and_free_text() {
+        let p = parse_query_syntax("source:claude days:7 -崩溃 panic 発生 \"exact phrase\"");
+        assert_eq!(p.source.as_deref(), Some("claude"));
+        assert_eq!(p.days, Some(7));
+        assert_eq!(p.excluded, vec!["崩溃".to_string()]);
+        assert_eq!(p.free_text, "panic 発生 exact phrase");
+        assert_eq!(p.project, None);
+
+        // Unknown key:value stays free text — a URL must not lose its colon.
+        let p = parse_query_syntax("https://example.com/a:1");
+        assert_eq!(p.source, None);
+        assert_eq!(p.free_text, "https://example.com/a:1");
+
+        // Invalid days is left as free text, not silently accepted.
+        let p = parse_query_syntax("days:x hello");
+        assert_eq!(p.days, None);
+        assert_eq!(p.free_text, "days:x hello");
+
+        let p = parse_query_syntax("-only-exclusion");
+        assert_eq!(p.excluded, vec!["only-exclusion".to_string()]);
+        assert!(p.free_text.is_empty());
+    }
+
+    #[test]
+    fn query_syntax_filters_flow_into_search() {
+        // Three docs across two sources and one with the excluded word.
+        let (index, _dir) = reg_index_proj(
+            "syntax",
+            &[
+                (
+                    1_788_874_500,
+                    "rust lifetime issues in generic code",
+                    "proj-a",
+                ),
+                (
+                    1_788_874_600,
+                    "rust lifetime issues again but blocked",
+                    "proj-a",
+                ),
+                (1_788_874_700, "rust lifetimes explained clearly", "proj-b"),
+            ],
+        );
+
+        // -blocked removes the second doc only.
+        let resp = search(&index, "rust lifetime -blocked");
+        assert_eq!(resp.results.len(), 2, "excluded doc drops out");
+        assert!(resp
+            .results
+            .iter()
+            .all(|h| !h.snippet.to_lowercase().contains("blocked")));
+
+        // source: filter — all corpus docs are zcode, so a foreign source
+        // answers nothing while the bare query answers.
+        let bare = search(&index, "rust lifetime");
+        assert!(!bare.results.is_empty());
+        let foreign = index.search(
+            "rust lifetime source:claude",
+            &SearchFilter {
+                limit: 10,
+                ..Default::default()
+            },
+        );
+        assert!(foreign.results.is_empty(), "source: filter applies");
+
+        // days:300 keeps the (recent) corpus; days:0-style tiny windows do not.
+        let recent = index.search(
+            "rust lifetime days:300",
+            &SearchFilter {
+                limit: 10,
+                ..Default::default()
+            },
+        );
+        assert_eq!(recent.results.len(), bare.results.len());
+        let ancient = index.search(
+            "rust lifetime days:1",
+            &SearchFilter {
+                limit: 10,
+                ..Default::default()
+            },
+        );
+        assert!(ancient.results.is_empty(), "1-day window predates the docs");
     }
 
     /// Like `reg_index`, with an explicit project per doc.

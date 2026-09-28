@@ -18,15 +18,20 @@ cargo clippy --release --all-targets -- -D warnings
 echo "==> cargo test --release"
 cargo test --release
 
+echo "==> memory budget gate (synthetic 20k-doc index)"
+cargo run --release --example memgate --quiet
+
 echo "==> cargo build --release"
 cargo b
 
-# The README's headline claim is a ~4 MB single binary. The guard sits at 2x
-# so it never trips on platform variance, but still catches adding a heavy
-# dependency (DuckDB once added 19 MB). Override: TOKENBUDDY_SIZE_LIMIT_MB.
+# The README's headline claim is a single-binary tool; the guard exists to
+# catch runaway dependency creep (DuckDB once added 19 MB), not to pin an
+# exact size. Budget raised to 20 MB (2026-09-28) so new collectors and
+# features have room; anything approaching the ceiling still warrants a
+# bloat check before merge. Override: TOKENBUDDY_SIZE_LIMIT_MB.
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 BIN="$TARGET_DIR/release/tokenbuddy"
-LIMIT_MB="${TOKENBUDDY_SIZE_LIMIT_MB:-8}"
+LIMIT_MB="${TOKENBUDDY_SIZE_LIMIT_MB:-20}"
 LIMIT=$((LIMIT_MB * 1024 * 1024))
 SIZE=$(wc -c < "$BIN" | tr -d ' ')
 echo "==> binary size guard: $SIZE bytes (limit ${LIMIT_MB} MB)"

@@ -4,12 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TokenBuddy · Token 管理台</title>
+<script>/* pre-paint language: apply English before first render to avoid a flash */
+(function(){try{if((localStorage.getItem('tb_lang')||((navigator.language||'').toLowerCase().startsWith('zh')?'zh':'en'))==='en')document.title='TokenBuddy · Token console';}catch(e){}})();
+</script>
 <style>
 :root {
   --bg: #ffffff; --panel: #ffffff; --panel2: #f5f5f7; --border: #e8e8ed;
   --text: #1d1d1f; --muted: #6e6e73; --faint: #86868b;
   --claude: #0071e3; --opencode: #34a853; --mimo: #9a4ddb; --zcode: #e8820c;
   --pi: #0ea5a0; --qoder: #e0447c; --workbuddy: #5e6ad2; --minimax: #d93025;
+  --hermes: #0891b2;
   --ok: #248a3d; --over: #d70015; --link: #0066cc;
   --ring: rgba(0, 113, 227, .18);
   --shadow: 0 1px 8px rgba(0, 0, 0, .05);
@@ -23,7 +27,8 @@
 html { scroll-behavior: smooth; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; }
 ::selection { background: rgba(0, 113, 227, .18); }
-.hidden { display: none; }
+/* !important: .stats/.tabs 等后面的 display 规则会压过普通 .hidden，视图切换需要强隐藏 */
+.hidden { display: none !important; }
 
 /* ---------- 动效 ---------- */
 @keyframes fadeUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }
@@ -88,6 +93,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI'
 .select { appearance: none; -webkit-appearance: none; border: 1px solid #d2d2d7; background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%236e6e73' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 12px center/10px; border-radius: 12px; padding: 8px 32px 8px 14px; font-size: 13px; color: var(--text); cursor: pointer; font-family: inherit; transition: border-color .2s, box-shadow .2s; }
 .select:focus { outline: none; border-color: #0071e3; box-shadow: 0 0 0 4px var(--ring); }
 .select-sm { padding: 5px 28px 5px 12px; font-size: 12px; border-radius: 999px; }
+.cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px 18px; }
+.cfg-grid label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--faint); }
+.cfg-grid input[type=text], .cfg-grid input[type=password], .cfg-grid input[type=number] { padding: 8px 12px; background: #fff; border: 1px solid #d2d2d7; color: var(--text); border-radius: 10px; font-size: 13px; font-family: inherit; transition: border-color .2s, box-shadow .2s; }
+.cfg-grid input:focus { outline: none; border-color: #0071e3; box-shadow: 0 0 0 4px var(--ring); }
+.cfg-check { flex-direction: row !important; align-items: center; gap: 8px !important; color: var(--text) !important; font-size: 13px !important; cursor: pointer; }
+.cfg-check input { accent-color: #0071e3; width: 16px; height: 16px; cursor: pointer; }
 
 .container { max-width: var(--page-w); margin: 0 auto; padding: 0 var(--page-pad); }
 
@@ -338,6 +349,63 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+/* ---------- 状态区与数据源健康 ---------- */
+/* static on purpose: the panel anchors to the nav (the nearest positioned
+   ancestor) instead of this chip, so a chip that sits near the left edge —
+   which is where the header wraps to on narrow screens — cannot push the
+   panel off the viewport. */
+.status-wrap { position: static; display: flex; align-items: center; gap: 8px; }
+.status-chip[data-kind="ok"] { color: var(--ok); }
+.status-chip[data-kind="warn"] { color: #b25000; }
+.status-chip[data-kind="bad"] { color: var(--over); }
+.status-chip[data-kind="busy"] { color: var(--claude); }
+.chip-btn { background: var(--panel2); border: 1px solid var(--border); color: var(--muted); font-size: 11.5px; font-family: inherit; padding: 4px 11px; border-radius: 999px; cursor: pointer; white-space: nowrap; }
+.chip-btn:hover { color: var(--text); }
+.chip-btn.alert { color: var(--over); border-color: rgba(215,0,21,.35); background: rgba(215,0,21,.06); }
+.health-panel { position: absolute; right: var(--page-pad); top: 100%; width: 420px; max-width: calc(100vw - 2 * var(--page-pad)); max-height: 72vh; overflow-y: auto; background: #fff; border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow-lift); padding: 15px; z-index: 120; text-align: left; }
+.health-panel h3 { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 10px; }
+.health-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--border); font-size: 12.5px; }
+.health-row:first-of-type { border-top: none; }
+.health-row .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.health-row .name { font-weight: 600; }
+.health-row .path { color: var(--faint); font-size: 10.5px; margin-left: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; word-break: break-all; max-width: 58%; }
+.dot-ok { background: var(--ok); } .dot-off { background: #c7c7cc; } .dot-err { background: var(--over); }
+.health-note { margin-top: 11px; font-size: 11.5px; color: var(--muted); line-height: 1.55; }
+.health-err { color: var(--over); }
+.health-foot { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border); font-size: 11px; color: var(--faint); }
+
+/* ---------- 首次运行引导 ---------- */
+.first-run { background: linear-gradient(135deg, #f4f8ff, #fbfbfd); border: 1px solid var(--border); border-radius: 18px; padding: 26px 28px; margin-bottom: 18px; box-shadow: var(--shadow); }
+.first-run h2 { font-size: 19px; font-weight: 700; margin-bottom: 6px; letter-spacing: -.01em; }
+.first-run p { font-size: 13px; color: var(--muted); line-height: 1.65; margin-bottom: 14px; max-width: 720px; }
+.first-run-found { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+.found-chip { display: inline-flex; align-items: center; gap: 7px; background: #fff; border: 1px solid var(--border); border-radius: 999px; padding: 5px 13px; font-size: 12.5px; }
+.found-chip .dot { width: 7px; height: 7px; border-radius: 50%; }
+.first-run-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.btn-lg { padding: 10px 22px; font-size: 14px; border-radius: 12px; }
+
+/* ---------- 导出 ---------- */
+.btn-export { background: none; border: 1px solid var(--border); color: var(--muted); font-size: 11.5px; font-family: inherit; padding: 4px 10px; border-radius: 8px; cursor: pointer; white-space: nowrap; }
+.btn-export:hover { color: var(--text); border-color: var(--faint); }
+
+/* ---------- 键盘可达性 ---------- */
+:focus-visible { outline: 2px solid #0071e3; outline-offset: 2px; border-radius: 8px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* ---------- 窄屏 ---------- */
+@media (max-width: 720px) {
+  .topnav-inner { gap: 8px; }
+  .brand .sub { display: none; }
+  .topnav-right { width: 100%; order: 4; }
+  .controls { flex-wrap: wrap; }
+  .controls input[type="text"] { width: 100% !important; }
+  .tabs { display: flex; width: 100%; overflow-x: auto; }
+  .tab { flex: 1 0 auto; padding: 7px 16px; }
+  /* 宽表保持自身宽度、靠容器横向滚动，而不是把每个单元格挤成两行字 */
+  .table-wrap table, .panel.table-wrap table { min-width: 620px; }
+  .stat-value { font-size: 24px; }
+  .first-run { padding: 20px; }
+}
 </style>
 </head>
 <body>
@@ -347,15 +415,21 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
     <div class="brand">
       <span class="logo">◆</span><h1>TokenBuddy</h1><span class="sub">Local-first · Token 管理台</span>
     </div>
-    <nav class="nav-menu">
-      <a class="nav-item active" data-view="stats">统计</a>
-      <a class="nav-item" data-view="search">搜索</a>
+    <nav class="nav-menu" role="tablist" aria-label="主视图切换">
+      <a class="nav-item active" role="tab" aria-selected="true" data-view="stats">统计</a>
+      <a class="nav-item" role="tab" aria-selected="false" data-view="search">搜索</a>
     </nav>
     <div class="topnav-right">
-      <span id="status" class="status-chip">加载中…</span>
+      <div class="status-wrap">
+        <span id="status" class="status-chip" role="status" aria-live="polite">加载中…</span>
+        <button class="chip-btn" id="healthBtn" onclick="toggleHealth(event)"
+                aria-expanded="false" aria-controls="healthPanel">数据源</button>
+        <div id="healthPanel" class="health-panel hidden" role="region" aria-label="数据源状态"></div>
+      </div>
       <select id="syncMode" class="select select-sm"><option value="incremental">增量同步</option><option value="full">全量重建</option></select>
       <button class="btn ghost btn-sm" onclick="loadAll()">刷新</button>
       <button class="btn primary btn-sm" onclick="sync()">同步数据</button>
+      <button class="chip-btn" id="langToggle" onclick="toggleLang(event)" title="切换语言 / Switch language">EN</button>
       <button class="nav-search-btn" id="searchToggle" title="搜索（快捷键 /）">
         <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
           <circle cx="10.5" cy="10.5" r="7" stroke="currentColor" stroke-width="2.2"/>
@@ -401,6 +475,9 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
       <svg viewBox="0 0 12 12" width="10" height="10" xmlns="http://www.w3.org/2000/svg"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
     </button>
   </div>
+  <div class="digest-sub" style="margin:6px 4px 0" id="ctxSyntaxHint">
+    支持语法：<code>source:claude</code> <code>project:目录名</code> <code>role:user</code> <code>days:7</code> <code>-排除词</code> <code>"精确短语"</code>——语法优先于上方筛选器
+  </div>
 
   <div class="ctx-filters">
     <select id="ctxSource" class="select">
@@ -413,6 +490,7 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
       <option value="qoder">Qoder</option>
       <option value="workbuddy">WorkBuddy</option>
       <option value="minimax">MiniMax</option>
+      <option value="hermes">Hermes</option>
     </select>
     <select id="ctxRole" class="select">
       <option value="all">全部角色</option>
@@ -482,12 +560,31 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
       <option value="qoder">Qoder</option>
       <option value="workbuddy">WorkBuddy</option>
       <option value="minimax">MiniMax</option>
+      <option value="hermes">Hermes</option>
     </select>
     <input type="text" id="modelFilter" placeholder="按模型过滤…" style="width:180px">
+    <span class="controls-label" style="margin-left:8px">数据</span>
+    <select id="dataScope" class="select" title="本机数据或 Fleet 多机汇聚">
+      <option value="local" selected>本机</option>
+      <option value="fleet">Fleet 多机</option>
+    </select>
+    <select id="fleetHost" class="select hidden" title="只看一台主机">
+      <option value="all">全部主机</option>
+    </select>
   </div>
 
-  <div class="section-label">速览</div>
-  <div class="panel">
+  <div id="firstRun" class="first-run hidden">
+    <h2>还没有导入任何数据</h2>
+    <p>TokenBuddy 读取各个 AI 编程工具本来就写在本地磁盘上的会话日志——不需要账号、不需要配置、不联网。导入一次，就把已有历史汇成一张总账。</p>
+    <div class="first-run-found" id="firstRunFound"></div>
+    <div class="first-run-actions">
+      <button class="btn primary btn-lg" onclick="sync()">导入数据</button>
+      <button class="btn ghost btn-lg" onclick="dismissFirstRun()">先看看界面</button>
+    </div>
+  </div>
+
+  <div class="section-label" id="digestLabel">速览</div>
+  <div class="panel" id="digestPanel">
     <div class="digest-head">
       <h2>近 <span id="digestDaysLabel">7</span> 天 vs 上一个周期</h2>
       <select id="digestDays" class="select select-sm">
@@ -508,16 +605,81 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
     </div>
   </div>
 
+  <div id="anomalyBanner" class="hidden" style="margin-top:12px;padding:10px 14px;border:1px solid var(--over);border-radius:10px;color:var(--over);font-size:13px"></div>
   <section class="stats" id="kpiStats" style="margin-top:16px"></section>
+  <section class="stats hidden" id="windowFacts" style="margin-top:8px"></section>
 
-  <nav class="tabs">
-    <button class="tab active" data-tab="overview">概览</button>
-    <button class="tab" data-tab="models">模型对比</button>
-    <button class="tab" data-tab="insights">深度分析</button>
+  <!-- ===================== Fleet 多机视图（与 Tab 区互斥显示） ===================== -->
+  <div id="viewFleet" class="hidden">
+    <div class="section-label">Fleet 多机总账</div>
+    <div class="panel" style="margin-bottom:16px">
+      <div class="chart-head">
+        <h2>同步</h2>
+        <div style="display:flex;gap:10px">
+          <button class="btn ghost btn-sm" onclick="toggleFleetConfig()">⚙ 配置</button>
+          <button class="btn ghost btn-sm" onclick="fleetAction('pull')">⤓ Sync now</button>
+          <button class="btn primary btn-sm" onclick="fleetAction('push')">⤒ Push now</button>
+        </div>
+      </div>
+      <div class="digest-sub" id="fleetStatus">汇聚的是各机 token 账单（data.parquet），对话全文 context.parquet 不参与推送。首次使用：点「⚙ 配置」填入 RustFS 地址与密钥，或手动创建 ~/.tokenbuddy/fleet.toml。</div>
+    </div>
+
+    <div class="panel hidden" id="fleetCfgPanel" style="margin-bottom:16px">
+      <div class="chart-head">
+        <h2>RustFS / Fleet 配置</h2>
+        <div style="display:flex;gap:10px">
+          <button class="btn ghost btn-sm" onclick="testFleetCfg()">测试连接</button>
+          <button class="btn primary btn-sm" onclick="saveFleetCfg()">保存</button>
+        </div>
+      </div>
+      <div class="cfg-grid">
+        <label class="cfg-check"><input type="checkbox" id="cfgEnabled"> 启用 Fleet（写入 enabled = true）</label>
+        <label>host_id（留空 = 本机主机名）<input type="text" id="cfgHostId" placeholder="mac-air" spellcheck="false"></label>
+        <label>endpoint<input type="text" id="cfgEndpoint" placeholder="http://rustfs.lan:9000" spellcheck="false"></label>
+        <label>bucket<input type="text" id="cfgBucket" placeholder="tokenbuddy" spellcheck="false"></label>
+        <label>access_key<input type="text" id="cfgAccessKey" placeholder="access key" spellcheck="false" autocomplete="off"></label>
+        <label>secret_key（留空 = 保持不变）<input type="password" id="cfgSecretKey" placeholder="••••" autocomplete="new-password"></label>
+        <label>region<input type="text" id="cfgRegion" placeholder="us-east-1" spellcheck="false"></label>
+        <label>push_interval_secs（60–86400）<input type="number" id="cfgInterval" min="60" max="86400" step="60" value="3600"></label>
+        <label class="cfg-check"><input type="checkbox" id="cfgPathStyle" checked> path_style（RustFS/MinIO 用 true）</label>
+        <label class="cfg-check"><input type="checkbox" id="cfgAutoPush" checked> auto_push（每小时后台推送，重启后生效）</label>
+      </div>
+      <div class="digest-sub" id="fleetCfgStatus" style="margin-top:8px">保存写入 ~/.tokenbuddy/fleet.toml（0600）；secret_key 只写不读，页面永远拿不到明文。</div>
+    </div>
+
+    <section class="stats" id="fleetCards"></section>
+
+    <div class="grid-2col" style="margin-top:26px">
+      <div class="panel">
+        <div class="chart-head"><h2>各机明细</h2>
+          <button class="btn-export" onclick="exportTable('fleetHosts','各机明细')">⤓ CSV</button>
+        </div>
+        <div class="table-wrap"><table id="fleetHosts">
+          <thead><tr>
+            <th>主机</th><th>请求数</th><th>Input</th><th>Output</th>
+            <th>Cache 读</th><th>Cache 写</th><th>总计</th><th>Credits</th>
+            <th>平均耗时</th><th>Cache 命中</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table></div>
+        <div class="digest-sub" style="margin-top:6px">每行一台主机；数字来自各机推送的 data.parquet，与该机本机视图口径一致</div>
+      </div>
+      <div class="panel">
+        <div class="chart-head"><h2>主机 × 来源</h2></div>
+        <div id="fleetMatrix"></div>
+        <div class="heatmap-legend"><span>低</span><div class="gradient"></div><span>高</span></div>
+      </div>
+    </div>
+  </div>
+
+  <nav class="tabs" role="tablist" aria-label="统计视图切换">
+    <button class="tab active" role="tab" id="tabbtn-overview" aria-controls="tab-overview" aria-selected="true" data-tab="overview">概览</button>
+    <button class="tab" role="tab" id="tabbtn-models" aria-controls="tab-models" aria-selected="false" tabindex="-1" data-tab="models">模型对比</button>
+    <button class="tab" role="tab" id="tabbtn-insights" aria-controls="tab-insights" aria-selected="false" tabindex="-1" data-tab="insights">深度分析</button>
   </nav>
 
   <!-- ===================== 概览 ===================== -->
-  <div id="tab-overview" class="tabview">
+  <div id="tab-overview" class="tabview" role="tabpanel" aria-labelledby="tabbtn-overview">
     <div class="section-label">用量时间线</div>
     <div class="panel">
       <div class="chart-head">
@@ -538,13 +700,18 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
 
     <div class="grid-2col" style="margin-top:26px">
       <div class="panel">
-        <div class="chart-head"><h2>明细表</h2></div>
+        <div class="chart-head"><h2>明细表</h2>
+          <button class="btn-export" onclick="exportTable('sources','来源明细')">⤓ CSV</button>
+        </div>
         <div class="digest-sub">按来源</div>
         <div class="table-wrap"><table id="sources">
           <thead><tr><th>来源</th><th>请求数</th><th>Input</th><th>Output</th><th>Cache 读</th><th>Cache 写</th><th>Credits</th><th>上下文水位</th></tr></thead>
           <tbody></tbody>
         </table></div>
-        <div class="digest-sub" style="margin-top:18px">按模型（Top 用量）</div>
+        <div class="digest-sub" style="margin-top:18px; display:flex; justify-content:space-between; align-items:center">
+          <span>按模型（Top 用量）</span>
+          <button class="btn-export" onclick="exportTable('models','模型用量')">⤓ CSV</button>
+        </div>
         <div class="table-wrap"><table id="models">
           <thead><tr>
             <th class="sortable" onclick="sortBy('source')">来源</th>
@@ -583,10 +750,13 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
   </div>
 
   <!-- ===================== 模型对比 ===================== -->
-  <div id="tab-models" class="tabview hidden">
+  <div id="tab-models" class="tabview hidden" role="tabpanel" aria-labelledby="tabbtn-models">
     <div class="section-label">Token 份额（Top 12 模型）</div>
     <div class="panel" id="modelShareBars"></div>
-    <div class="section-label">模型对比明细</div>
+    <div class="section-label" style="display:flex; justify-content:space-between; align-items:center">
+      <span>模型对比明细</span>
+      <button class="btn-export" onclick="exportTable('modelCompare','模型对比')">⤓ CSV</button>
+    </div>
     <div class="panel table-wrap" style="padding:0">
       <table id="modelCompare">
         <thead><tr>
@@ -607,27 +777,30 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
   </div>
 
   <!-- ===================== 深度分析 ===================== -->
-  <div id="tab-insights" class="tabview hidden">
+  <div id="tab-insights" class="tabview hidden" role="tabpanel" aria-labelledby="tabbtn-insights">
     <div class="grid-2col">
       <div class="panel">
         <div class="chart-head"><h2>工作节奏 · 按小时（中国时间）</h2></div>
-        <svg id="rhythmSvg" width="100%" height="240"></svg>
+        <svg id="rhythmSvg" width="100%" height="240" role="img" aria-label="按小时的 token 用量柱状图，完整数字见下方会话与来源明细表"></svg>
         <div class="digest-sub" style="margin-top:6px">横轴 0–23 点 · 柱高为该小时的 token 总量，悬停查看请求数</div>
       </div>
       <div class="panel">
         <div class="chart-head"><h2>缓存效率趋势</h2></div>
-        <svg id="cacheTrendSvg" width="100%" height="240"></svg>
+        <svg id="cacheTrendSvg" width="100%" height="240" role="img" aria-label="每日缓存命中率趋势折线图，完整数字见下方表格"></svg>
         <div class="digest-sub" style="margin-top:6px" id="cacheServedNote"></div>
       </div>
     </div>
     <div class="grid-2col" style="margin-top:26px">
       <div class="panel">
         <div class="chart-head"><h2>会话 Top 榜</h2>
+          <div style="display:flex; gap:8px; align-items:center">
+          <button class="btn-export" onclick="exportTable('sessionTable','会话榜')">⤓ CSV</button>
           <select id="sessionLimit" class="select select-sm">
             <option value="10">Top 10</option>
             <option value="20" selected>Top 20</option>
             <option value="50">Top 50</option>
           </select>
+          </div>
         </div>
         <div class="table-wrap"><table id="sessionTable">
           <thead><tr>
@@ -644,16 +817,43 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
         <div class="digest-sub" style="margin-top:6px" id="ctxFillNote"></div>
       </div>
     </div>
+    <div class="panel" style="margin-top:26px">
+      <div class="chart-head"><h2>项目 × 模型透视</h2>
+        <button class="btn-export" onclick="exportTable('pivotTable','项目透视')">⤓ CSV</button>
+      </div>
+      <div class="table-wrap"><table id="pivotTable">
+        <thead><tr>
+          <th>工程</th><th>模型</th><th>Tokens</th><th>请求数</th><th>占该工程</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <div class="digest-sub" style="margin-top:6px">「哪个项目在烧 token」的事实答案：归因只来自来源日志的确定性字段（如 cwd），未归因的行以 — 显示。</div>
+    </div>
   </div>
 </div>
 </div>
 
-<footer>TokenBuddy v0.4 · 数据来自 Claude / OpenCode / Mimo / Zcode / Pi / Qoder / WorkBuddy / MiniMax 本地日志</footer>
+<footer>TokenBuddy v0.5.0 · 数据来自 Claude / OpenCode / Mimo / Zcode / Pi / Qoder / WorkBuddy / MiniMax / Hermes 本地日志</footer>
 
 <script>
-const SRC_COLORS = { claude: '#0071e3', opencode: '#34a853', mimo: '#9a4ddb', zcode: '#e8820c', pi: '#0ea5a0', qoder: '#e0447c', workbuddy: '#5e6ad2', minimax: '#d93025' };
-const SRC_NAMES = { claude: 'Claude', opencode: 'OpenCode', mimo: 'Mimo', zcode: 'Zcode', pi: 'Pi', qoder: 'Qoder', workbuddy: 'WorkBuddy', minimax: 'MiniMax' };
-const SRC_KEYS = ['claude', 'opencode', 'mimo', 'zcode', 'pi', 'qoder', 'workbuddy', 'minimax'];
+// Remote-access mode (TOKENBUDDY_TOKEN): the page is reached as /?token=…
+// because a top-level navigation cannot send an Authorization header. Wrap
+// fetch once so every API call on the page carries the same token. No token
+// in the URL → nothing changes.
+const TB_TOKEN = new URLSearchParams(location.search).get('token') || '';
+if (TB_TOKEN) {
+  const tbOrigFetch = window.fetch.bind(window);
+  window.fetch = function(input, init) {
+    try {
+      const u = new URL(input instanceof Request ? input.url : input, location.origin);
+      if (!u.searchParams.has('token')) u.searchParams.set('token', TB_TOKEN);
+      return tbOrigFetch(u.toString(), init);
+    } catch (e) { return tbOrigFetch(input, init); }
+  };
+}
+const SRC_COLORS = { claude: '#0071e3', codex: '#10a37f', gemini: '#4285f4', qwen: '#7b3fe4', opencode: '#34a853', mimo: '#9a4ddb', zcode: '#e8820c', pi: '#0ea5a0', qoder: '#e0447c', workbuddy: '#5e6ad2', minimax: '#d93025', hermes: '#0891b2' };
+const SRC_NAMES = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini', qwen: 'Qwen', opencode: 'OpenCode', mimo: 'Mimo', zcode: 'Zcode', pi: 'Pi', qoder: 'Qoder', workbuddy: 'WorkBuddy', minimax: 'MiniMax', hermes: 'Hermes' };
+const SRC_KEYS = ['claude', 'codex', 'gemini', 'qwen', 'opencode', 'mimo', 'zcode', 'pi', 'qoder', 'workbuddy', 'minimax', 'hermes'];
 let sortField = 'total_tokens', sortDir = 'desc', modelData = [];
 let sortMField = 'total_tokens', sortMDir = 'desc';
 let modelCompare = { models: [] };
@@ -691,8 +891,9 @@ function filterParams(extra) {
 }
 
 async function loadAll() {
+  document.getElementById('status').dataset.busy = '';
   try {
-    const [sumRes, metRes, modRes, tlRes, hmRes, digRes, insRes] = await Promise.all([
+    const [sumRes, metRes, modRes, tlRes, hmRes, digRes, insRes, winRes, pivRes] = await Promise.all([
       fetch('/api/summary?' + filterParams()),
       fetch('/api/metrics?' + filterParams()),
       fetch('/api/models?' + filterParams()),
@@ -700,6 +901,8 @@ async function loadAll() {
       fetch('/api/heatmap?' + filterParams({ mode: document.getElementById('heatmapMode').value, metric: document.getElementById('heatmapMetric').value })),
       fetch('/api/digest?days=' + document.getElementById('digestDays').value),
       fetch('/api/insights?' + filterParams({ limit: document.getElementById('sessionLimit').value })),
+      fetch('/api/windows'),
+      fetch('/api/pivot' + (pivotStartParam() ? '?' + pivotStartParam() : '')),
     ]);
     const summary = await sumRes.json();
     const metrics = await metRes.json();
@@ -708,20 +911,29 @@ async function loadAll() {
     const heatmap = await hmRes.json();
     const digest = await digRes.json();
     const insights = await insRes.json();
+    const windows = await winRes.json();
+    const pivot = await pivRes.json();
+    fetch('/api/anomalies').then(r => r.json()).then(renderAnomalies).catch(() => {});
 
-    G = { summary, metrics, timeline, heatmap, digest, insights };
+    G = { summary, metrics, timeline, heatmap, digest, insights, windows };
+    renderPivot(pivot);
     renderAll();
-    document.getElementById('status').textContent =
-      `已加载 ${summary.total_requests.toLocaleString()} 条记录`;
+    const chip = document.getElementById('status');
+    chip.dataset.busy = '1';
+    chip.textContent = `已加载 ${summary.total_requests.toLocaleString()} 条记录`;
+    chip.dataset.kind = 'ok';
+    // Fleet 面板激活时随刷新按钮一起重取。
+    if (document.getElementById('dataScope').value === 'fleet') loadFleet();
   } catch (e) {
-    document.getElementById('status').textContent = '加载失败: ' + e.message;
+    setStatus('加载失败：' + e.message, 'bad');
   }
 }
 
 function renderAll() {
-  const { summary, metrics, timeline, heatmap, digest, insights } = G;
+  const { summary, metrics, timeline, heatmap, digest, insights, windows } = G;
   renderDigest(digest);
   renderKpis(summary, metrics.totals);
+  renderWindows(windows);
   renderSourceCards(metrics);
   renderSourcesTable(summary.by_source);
   renderModelsTable(summary.by_model);
@@ -729,6 +941,240 @@ function renderAll() {
   renderTimeline(timeline);
   renderHeatmap(heatmap);
   renderInsights(insights);
+}
+
+/* ---------- Fleet 多机视图 ---------- */
+// The controls' 本机/Fleet switch flips which panels are visible; Fleet data
+// flows from the pulled host parquets, not from the local /api/* reports.
+function applyDataScope() {
+  const fleet = document.getElementById('dataScope').value === 'fleet';
+  document.getElementById('fleetHost').classList.toggle('hidden', !fleet);
+  document.getElementById('viewFleet').classList.toggle('hidden', !fleet);
+  document.getElementById('digestLabel').classList.toggle('hidden', fleet);
+  document.getElementById('digestPanel').classList.toggle('hidden', fleet);
+  document.getElementById('kpiStats').classList.toggle('hidden', fleet);
+  if (fleet) document.getElementById('windowFacts').classList.add('hidden');
+
+  document.querySelector('.tabs').classList.toggle('hidden', fleet);
+  if (fleet) {
+    document.querySelectorAll('.tabview').forEach(v => v.classList.add('hidden'));
+    loadFleetHosts().then(loadFleet);
+  } else {
+    // Restore whichever tab was active before the switch.
+    const active = document.querySelector('.tab.active');
+    document.querySelectorAll('.tabview').forEach(v =>
+      v.classList.toggle('hidden', !active || v.id !== 'tab-' + active.dataset.tab));
+  }
+}
+
+async function loadFleetHosts() {
+  try {
+    const res = await fetch('/api/fleet/hosts');
+    const d = await res.json();
+    const sel = document.getElementById('fleetHost');
+    const cur = sel.value || 'all';
+    sel.innerHTML = '<option value="all">全部主机</option>'
+      + (d.hosts || []).map(h => `<option value="${esc(h)}">${esc(h)}</option>`).join('');
+    if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  } catch (_) { /* fleet not configured: dropdown stays "all" only */ }
+}
+
+async function loadFleet() {
+  const host = document.getElementById('fleetHost').value;
+  const p = filterParams(host !== 'all' ? { host } : {});
+  const status = document.getElementById('status');
+  try {
+    const [sumRes, metRes] = await Promise.all([
+      fetch('/api/fleet/summary?' + p),
+      fetch('/api/fleet/metrics?' + p),
+    ]);
+    const summary = await sumRes.json();
+    if (summary.error) { status.textContent = 'Fleet 加载失败: ' + summary.error; return; }
+    renderFleet(summary, await metRes.json());
+  } catch (e) {
+    status.textContent = 'Fleet 加载失败: ' + e.message;
+  }
+}
+
+function renderFleet(summary, metrics) {
+  const t = summary.totals || {};
+  document.getElementById('fleetCards').innerHTML = `
+  <div class="stat blue"><div class="stat-label"><span class="dot"></span>Fleet Tokens</div>
+    <div class="stat-value">${fmtTokens(t.total_tokens)}</div><div class="stat-sub">输入 ${fmtTokens(t.input_tokens)} · 输出 ${fmtTokens(t.output_tokens)}</div></div>
+  <div class="stat green"><div class="stat-label"><span class="dot"></span>请求数</div>
+    <div class="stat-value">${fmtReq(t.requests)}</div><div class="stat-sub">${t.hosts || 0} 台主机 · 缓存写 ${fmtTokens(t.cache_creation_tokens)}</div></div>
+  <div class="stat purple"><div class="stat-label"><span class="dot"></span>Cache 命中率</div>
+    <div class="stat-value">${fmtPct(t.cache_hit_rate)}</div><div class="stat-sub">缓存读 ${fmtTokens(t.cache_read_tokens)}</div></div>
+  <div class="stat orange"><div class="stat-label"><span class="dot"></span>Credits</div>
+    <div class="stat-value">${fmtCredits(t.credits)}</div><div class="stat-sub">工具原始上报，未折算</div></div>`;
+
+  // Per-host rows join the summary numbers with the latency/cache panel.
+  const byHostMetrics = {};
+  (metrics.by_host || []).forEach(m => { byHostMetrics[m.host] = m; });
+  const tbody = document.querySelector('#fleetHosts tbody');
+  const rows = summary.by_host || [];
+  tbody.innerHTML = rows.length ? rows.map(h => {
+    const m = byHostMetrics[h.host] || {};
+    return `<tr>
+    <td title="${esc(h.host)}">${esc(h.host.length > 22 ? h.host.slice(0, 20) + '…' : h.host)}</td>
+    <td>${fmtReq(h.requests)}</td>
+    <td>${fmtTokens(h.input_tokens)}</td>
+    <td>${fmtTokens(h.output_tokens)}</td>
+    <td>${fmtTokens(h.cache_read_tokens)}</td>
+    <td>${fmtTokens(h.cache_creation_tokens)}</td>
+    <td>${fmtTokens(h.total_tokens)}</td>
+    <td>${fmtCredits(h.credits)}</td>
+    <td>${fmtMs(m.avg_duration_ms)}</td>
+    <td>${fmtPct(m.cache_hit_rate)}</td>
+  </tr>`;
+  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--faint)">尚无主机数据——先在各机启用 Fleet 并推送，再点 ⤓ Sync now</td></tr>';
+
+  renderFleetMatrix(summary.host_source || []);
+}
+
+// Host × source grid in the same visual language as the model heatmap.
+function renderFleetMatrix(cells) {
+  const el = document.getElementById('fleetMatrix');
+  if (!cells.length) {
+    el.innerHTML = '<div style="color:var(--faint);padding:20px">当前过滤范围没有主机数据</div>';
+    return;
+  }
+  const hosts = [...new Set(cells.map(c => c.host))].sort();
+  const srcOrder = s => { const i = SRC_KEYS.indexOf(s); return i === -1 ? SRC_KEYS.length : i; };
+  const sources = [...new Set(cells.map(c => c.source))].sort((a, b) => srcOrder(a) - srcOrder(b));
+  const get = (h, s) => cells.find(c => c.host === h && c.source === s);
+  const max = Math.max(...cells.map(c => c.total_tokens), 0.0001);
+  const style = `grid-template-columns: minmax(120px, max-content) repeat(${sources.length}, minmax(70px, 1fr));`;
+  let html = `<div class="heatmap" style="${style}"><div class="cell label"></div>`;
+  for (const s of sources) {
+    html += `<div class="cell col-label" style="color:${SRC_COLORS[s] || '#86868b'}">${SRC_NAMES[s] || esc(s)}</div>`;
+  }
+  for (const h of hosts) {
+    html += `<div class="cell label" title="${esc(h)}">${esc(h)}</div>`;
+    for (const s of sources) {
+      const c = get(h, s);
+      const v = c ? c.total_tokens : null;
+      const t = v == null ? 0 : v / max;
+      const tc = (v != null && t > 0.55) ? '#fff' : '#1d1d1f';
+      const detail = c ? `${fmtTokens(v)} · ${fmtReq(c.requests)} 请求${c.credits ? ` · ${fmtCredits(c.credits)} credits` : ''}` : '—';
+      html += `<div class="cell" style="background:${heatColor(t)};color:${tc};opacity:${v == null ? 0.45 : 1}" title="${esc(h)} × ${esc(s)}: ${esc(detail)}">${v == null ? '—' : fmtTokens(v)}</div>`;
+    }
+  }
+  el.innerHTML = html + '</div>';
+}
+
+// Push now / Sync now: the same endpoints the CLI subcommands use.
+async function fleetAction(kind) {
+  const el = document.getElementById('fleetStatus');
+  const label = kind === 'push' ? '推送' : '拉取';
+  el.textContent = `Fleet ${label}中…`;
+  try {
+    const res = await fetch('/api/fleet/' + kind, { method: 'POST' });
+    const d = await res.json();
+    if (d.error) {
+      el.innerHTML = `<span style="color:var(--over)">Fleet ${label}失败：${esc(d.error)}</span>`;
+      return;
+    }
+    if (kind === 'push') {
+      el.textContent = `推送完成：${d.push.key}（${fmtTokens(d.push.bytes)} bytes）`;
+    } else {
+      el.textContent = `拉取完成：下载 ${(d.downloaded || []).join('、') || '无'} · 跳过未变化 ${(d.skipped || []).length} 台`;
+    }
+    loadFleet();
+  } catch (e) {
+    el.innerHTML = `<span style="color:var(--over)">Fleet ${label}失败：${esc(e.message)}</span>`;
+  }
+}
+
+/* ---------- Fleet 配置页 ---------- */
+// The backend never sends the real secret back — GET returns "••tail••". An
+// untouched secret field is sent as an empty string, which the API reads as
+// "keep what's on disk".
+const SECRET_MASK_PREFIX = '••';
+
+async function toggleFleetConfig() {
+  const panel = document.getElementById('fleetCfgPanel');
+  const show = panel.classList.contains('hidden');
+  panel.classList.toggle('hidden', !show);
+  if (show) loadFleetCfg();
+}
+
+async function loadFleetCfg() {
+  const status = document.getElementById('fleetCfgStatus');
+  try {
+    const res = await fetch('/api/fleet/config');
+    const d = await res.json();
+    if (d.error) { status.textContent = '读取配置失败：' + d.error; return; }
+    const c = d.config;
+    document.getElementById('cfgEnabled').checked = !!(c && c.enabled);
+    document.getElementById('cfgEndpoint').value = (c && c.endpoint) || '';
+    document.getElementById('cfgBucket').value = (c && c.bucket) || '';
+    document.getElementById('cfgAccessKey').value = (c && c.access_key) || '';
+    document.getElementById('cfgSecretKey').value = (c && c.secret_key) || '';
+    document.getElementById('cfgRegion').value = (c && c.region) || '';
+    document.getElementById('cfgHostId').value = (c && c.host_id) || '';
+    document.getElementById('cfgPathStyle').checked = !c || c.path_style;
+    document.getElementById('cfgAutoPush').checked = !c || c.auto_push;
+    document.getElementById('cfgInterval').value = (c && c.push_interval_secs) || 3600;
+    status.textContent = c
+      ? `当前配置：${d.path}（secret_key 以掩码显示）`
+      : `尚未配置（${d.path} 不存在，Fleet 功能关闭）——填好后勾选「启用」并保存。`;
+  } catch (e) {
+    status.textContent = '读取配置失败：' + e.message;
+  }
+}
+
+function cfgPayload() {
+  const secret = document.getElementById('cfgSecretKey').value;
+  return {
+    enabled: document.getElementById('cfgEnabled').checked,
+    endpoint: document.getElementById('cfgEndpoint').value,
+    bucket: document.getElementById('cfgBucket').value,
+    access_key: document.getElementById('cfgAccessKey').value,
+    // A masked (unchanged) or empty secret means "keep the stored one".
+    secret_key: secret.startsWith(SECRET_MASK_PREFIX) ? '' : secret,
+    region: document.getElementById('cfgRegion').value,
+    path_style: document.getElementById('cfgPathStyle').checked,
+    host_id: document.getElementById('cfgHostId').value,
+    auto_push: document.getElementById('cfgAutoPush').checked,
+    push_interval_secs: parseInt(document.getElementById('cfgInterval').value, 10) || 3600,
+  };
+}
+
+async function saveFleetCfg() {
+  const status = document.getElementById('fleetCfgStatus');
+  status.textContent = '保存中…';
+  try {
+    const res = await fetch('/api/fleet/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfgPayload()),
+    });
+    const d = await res.json();
+    if (d.error) { status.innerHTML = `<span style="color:var(--over)">保存失败：${esc(d.error)}</span>`; return; }
+    status.textContent = d.note;
+    await loadFleetCfg();
+    loadFleetHosts().then(loadFleet);
+  } catch (e) {
+    status.innerHTML = `<span style="color:var(--over)">保存失败：${esc(e.message)}</span>`;
+  }
+}
+
+async function testFleetCfg() {
+  const status = document.getElementById('fleetCfgStatus');
+  status.textContent = '测试连接中…';
+  try {
+    const res = await fetch('/api/fleet/config-test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfgPayload()),
+    });
+    const d = await res.json();
+    if (d.error) { status.innerHTML = `<span style="color:var(--over)">连接失败：${esc(d.error)}</span>`; return; }
+    status.textContent = '✓ ' + d.detail;
+  } catch (e) {
+    status.innerHTML = `<span style="color:var(--over)">连接失败：${esc(e.message)}</span>`;
+  }
 }
 
 /* ---------- 速览（集中指标） ---------- */
@@ -804,6 +1250,48 @@ function renderKpis(s, t) {
     <div class="stat-value">${fmtMs(t.avg_ttft_ms)}</div><div class="stat-sub">平均耗时 ${fmtMs(t.avg_duration_ms)}</div></div>
   <div class="stat pink"><div class="stat-label"><span class="dot"></span>模型数</div>
     <div class="stat-value">${(modelCompare.models || []).length}</div><div class="stat-sub">当前过滤范围内${s.total_credits ? ` · Credits ${fmtCredits(s.total_credits)}` : ''}</div></div>`;
+}
+
+/* ---------- 用量异常横幅(工作日 median/MAD 稳健 z) ---------- */
+// 只报事实与自己的基线:某日用量偏离同星期历史的 3.5 个稳健标准差才出现。
+function renderAnomalies(a) {
+  const el = document.getElementById('anomalyBanner');
+  if (!el || !a || !a.flagged || !a.flagged.length) { el.classList.add('hidden'); return; }
+  const latest = a.flagged[a.flagged.length - 1];
+  el.classList.remove('hidden');
+  el.innerHTML = `⚠ <b>${esc(latest.date)}</b> 用量 ${fmtTokens(latest.tokens)}，偏离同星期基线 ${fmtTokens(latest.baseline_median)}（稳健 z=${latest.modified_z > 50 ? '≫' : latest.modified_z.toFixed(1)}）。近 ${a.checked_days} 天共 ${a.flagged.length} 个异常日。`;
+}
+
+/* ---------- 窗口事实(限额视角,纯本地口径) ---------- */
+// 只报事实:当前 5h 窗口用量、燃速、28 天窗口 P90/峰值参考、7 天合计。
+// 不预测限额、不折算费用——订阅的"还剩多少"只有服务端知道,这里给的是
+// 你自己的历史节奏参照。
+function renderWindows(w) {
+  const el = document.getElementById('windowFacts');
+  if (!el || !w) return;
+  if (!w.open_window) {
+    el.innerHTML = '<div class="stat" style="grid-column:1/-1"><div class="stat-label"><span class="dot"></span>5h 窗口</div><div class="stat-sub">最近 5 小时没有请求——无打开的窗口</div></div>';
+    return;
+  }
+  const burn = w.open_window.burn_per_hour;
+  const h2p = w.hours_to_p90;
+  const ref = w.p90_5h_tokens > 0
+    ? `窗口 P90 参考 ${fmtTokens(w.p90_5h_tokens)} · 28日峰值 ${fmtTokens(w.max_5h_tokens)}`
+    : '28 天内窗口样本不足';
+  const pace = h2p == null ? '暂无燃速'
+    : (h2p <= 0 ? '已超过你自己的 P90 节奏'
+       : `按当前燃速 ${fmtTokens(Math.round(burn))}/h,约 ${h2p < 1 ? (h2p*60).toFixed(0) + ' 分钟' : h2p.toFixed(1) + ' 小时'}到达 P90 节奏`);
+  const pct = w.p90_ratio != null ? (w.p90_ratio * 100).toFixed(0) + '%' : '—';
+  el.innerHTML = `
+  <div class="stat blue"><div class="stat-label"><span class="dot"></span>当前 5h 窗口</div>
+    <div class="stat-value">${fmtTokens(w.open_window.window_tokens)}</div><div class="stat-sub">${w.open_window.window_requests} 请求 · 占自己 P90 ${pct}</div></div>
+  <div class="stat purple"><div class="stat-label"><span class="dot"></span>燃速</div>
+    <div class="stat-value">${fmtTokens(Math.round(burn))}<span style="font-size:13px;color:var(--muted)">/h</span></div><div class="stat-sub">${esc(pace)}</div></div>
+  <div class="stat orange"><div class="stat-label"><span class="dot"></span>滚动 7 天</div>
+    <div class="stat-value">${fmtTokens(w.week_tokens)}</div><div class="stat-sub">${w.week_requests} 请求</div></div>
+  <div class="stat pink"><div class="stat-label"><span class="dot"></span>窗口参照</div>
+    <div class="stat-value">${fmtTokens(w.p90_5h_tokens)}</div><div class="stat-sub">28 日内 5h 窗口 P90 · 峰值 ${fmtTokens(w.max_5h_tokens)}</div></div>
+  <div class="stat" style="grid-column:1/-1"><div class="stat-sub">${esc(ref)} — 纯本地事实,非官方限额</div></div>`;
 }
 
 /* ---------- 来源卡片 ---------- */
@@ -905,7 +1393,7 @@ function renderTimeline(buckets) {
   const n = buckets.length;
   const maxTokens = Math.max(...buckets.map(b => b.total_tokens)) || 1;
   const bw = Math.max(2, Math.min(26, width / n - 2));
-  const segs = [['claude_tokens','claude'],['opencode_tokens','opencode'],['mimo_tokens','mimo'],['zcode_tokens','zcode'],['pi_tokens','pi'],['qoder_tokens','qoder'],['workbuddy_tokens','workbuddy'],['minimax_tokens','minimax']];
+  const segs = [['claude_tokens','claude'],['opencode_tokens','opencode'],['mimo_tokens','mimo'],['zcode_tokens','zcode'],['pi_tokens','pi'],['qoder_tokens','qoder'],['workbuddy_tokens','workbuddy'],['minimax_tokens','minimax'],['hermes_tokens','hermes']];
 
   let g = `<g transform="translate(${margin.left},${margin.top})">`;
   for (let i = 0; i <= 5; i++) {
@@ -1027,6 +1515,55 @@ function drawTrendLine(svgId, pts, fmtVal, yMax) {
   });
   g += '</g>';
   svg.innerHTML = g;
+}
+
+/* --- R26: 项目 × 模型透视 ---
+   /api/pivot takes an absolute `start`; map the分析范围 select onto the
+   same UTC+8 day boundaries the backend uses (cn_midnight), so the table
+   follows the same range as every other panel. */
+function pivotStartParam() {
+  const t = document.getElementById('timeRange').value;
+  if (t === 'all') return '';
+  const days = t === 'today' ? 1 : parseInt(t, 10) || 7;
+  const start = Math.floor((Date.now() / 1000 + 8 * 3600) / 86400 - (days - 1)) * 86400 - 8 * 3600;
+  return 'start=' + start;
+}
+
+function renderPivot(p) {
+  const tbody = document.querySelector('#pivotTable tbody');
+  if (!tbody) return;
+  const rows = (p && p.rows) || [];
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--faint)">当前过滤范围没有数据</td></tr>';
+    return;
+  }
+  // Group by project, projects by total tokens desc, models within by tokens desc.
+  const byProject = new Map();
+  for (const r of rows) {
+    const key = r.project || '';
+    if (!byProject.has(key)) byProject.set(key, { tokens: 0, requests: 0, models: [] });
+    const g = byProject.get(key);
+    g.tokens += r.tokens;
+    g.requests += r.requests;
+    g.models.push(r);
+  }
+  const projects = [...byProject.entries()].sort((a, b) => b[1].tokens - a[1].tokens);
+  let html = '';
+  for (const [proj, g] of projects) {
+    const label = proj || '—';
+    const projRows = g.models.sort((a, b) => b.tokens - a.tokens);
+    projRows.forEach((r, i) => {
+      const share = g.tokens > 0 ? ((r.tokens / g.tokens) * 100).toFixed(1) + '%' : '—';
+      html += `<tr>
+        <td>${i === 0 ? `<b>${esc(label)}</b>` : ''}</td>
+        <td>${esc(r.model)}</td>
+        <td>${r.tokens > 0 ? fmtTokens(r.tokens) : '—'}</td>
+        <td>${fmtReq(r.requests)}</td>
+        <td>${share}</td>
+      </tr>`;
+    });
+  }
+  tbody.innerHTML = html;
 }
 
 function renderInsights(d) {
@@ -1182,7 +1719,9 @@ async function loadContextStats() {
   } catch (e) { ctxStats = null; }
   renderContextStatus();
   const phase = ctxStats && ctxStats.status && ctxStats.status.phase;
-  if (phase && phase !== 'ready' && phase !== 'failed') {
+  // 'empty' is the resting state now — the index is built on demand — so
+  // polling it would spin forever for a user who only reads statistics.
+  if (phase && phase !== 'ready' && phase !== 'failed' && phase !== 'empty') {
     clearTimeout(window.__ctxPoll);
     window.__ctxPoll = setTimeout(loadContextStats, 2000);
   }
@@ -1200,7 +1739,9 @@ function renderContextStatus() {
   } else if (s.phase === 'failed') {
     el.innerHTML = `<span class="bad">● 索引失败</span>：${esc(s.detail || '未知错误')}`;
   } else {
-    el.innerHTML = `<span class="busy">● ${PHASE_NAMES[s.phase] || s.phase}…</span>（首次构建需采集全部日志，完成后自动可搜）`;
+    el.innerHTML = s.phase === 'empty'
+      ? '<span>● 索引未构建</span>（只用统计的话它不会占用内存；进入搜索页时自动构建，或点「↻ 重建索引」）'
+      : `<span class="busy">● ${PHASE_NAMES[s.phase] || s.phase}…</span>（需采集全部日志，完成后自动可搜）`;
   }
 }
 
@@ -1875,25 +2416,218 @@ function clearContextSearch() {
 
 async function sync() {
   const mode = document.getElementById('syncMode').value;
-  document.getElementById('status').textContent = '同步中…';
+  const full = mode === 'full';
+  // 全量重建会把 data.parquet 挪走重采：已被轮转掉的日志无法还原，那部分历史
+  // 会真的消失（只在快照里）。一次点击就丢掉的东西，必须先讲清楚。
+  if (full && !confirm(
+    '全量重建会用现在还在的日志重新生成整张总账。\n\n' +
+    '已经被轮转/清理掉的旧日志无法重新采集，对应记录会从统计中消失' +
+    '（旧文件保留为快照，可恢复）。\n\n确定要继续吗？')) {
+    document.getElementById('syncMode').value = 'incremental';
+    return;
+  }
+  const t0 = performance.now();
+  let verdict = null, kind = 'ok';
+  setStatus('同步中…', 'busy');
+  const tick = setInterval(() => {
+    setStatus(`同步中… ${((performance.now() - t0) / 1000).toFixed(1)}s`, 'busy');
+  }, 100);
   try {
     const res = await fetch('/api/sync?mode=' + mode, { method: 'POST' });
     const data = await res.json();
+    clearInterval(tick);
     if (data.error) {
-      document.getElementById('status').textContent = '同步失败: ' + data.error;
+      setStatus('同步失败：' + data.error, 'bad');
     } else {
-      const total = SRC_KEYS.reduce((n, k) => n + (data[k + '_imported'] || 0), 0);
-      document.getElementById('status').textContent = `同步完成：新增 ${total} 条（${SRC_KEYS.map(k => `${SRC_NAMES[k]} ${data[k + '_imported'] || 0}`).join(' / ')}）`;
+      const secs = (data.duration_ms != null ? data.duration_ms / 1000
+                                                 : (performance.now() - t0) / 1000);
+      verdict = syncSummary(data, secs);
+      kind = (data.errors || []).length ? 'warn' : 'ok';
     }
-    loadAll();
+    await loadAll();
+    await loadStatus();
+    // 最后落一次：loadAll 与 loadStatus 都会重写状态行，不这样的话
+    // 「新增 N 条 / 净减 N 条」这个唯一有价值的结论会被通用文案冲掉。
+    if (verdict) setStatus(verdict, kind);
   } catch (e) {
-    document.getElementById('status').textContent = '同步失败: ' + e.message;
+    clearInterval(tick);
+    setStatus('同步失败：' + e.message, 'bad');
   }
 }
 
+/**
+ * 说清楚这一轮到底发生了什么。重建的措辞必须和增量区分开：重建会把
+ * “重新采集到的条数”说成“新增”，读起来像涨了，实际可能是在掉。
+ */
+function syncSummary(d, secs) {
+  const total = SRC_KEYS.reduce((n, k) => n + (d[k + '_imported'] || 0), 0);
+  const errs = (d.errors || []).length;
+  const errTail = errs ? ` · ${errs} 个来源失败` : '';
+  if (d.mode === 'full' || d.previous_total != null) {
+    const before = d.previous_total || 0;
+    const after = d.total_after != null ? d.total_after : before;
+    const delta = after - before;
+    const sign = delta > 0 ? `+${delta.toLocaleString()}` : delta.toLocaleString();
+    const net = delta === 0 ? '总量持平' : `净${delta > 0 ? '增' : '减'} ${Math.abs(delta).toLocaleString()}`;
+    return `全量重建完成 · 重新采集 ${total.toLocaleString()} 条 · ${net}（${before.toLocaleString()} → ${after.toLocaleString()}）· ${secs.toFixed(1)}s${errTail}`;
+  }
+  return `同步完成：新增 ${total.toLocaleString()} 条 · 现有 ${(d.total_after || 0).toLocaleString()} 条 · ${secs.toFixed(1)}s${errTail}`;
+}
+
+/* ---------- 状态区 / 数据源健康 / 首屏引导 ---------- */
+let STATUS = null;
+
+function setStatus(text, kind) {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.dataset.kind = kind || '';
+  const btn = document.getElementById('healthBtn');
+  if (btn) {
+    const bad = (STATUS && ((STATUS.state || {}).last_sync_errors || []).length) || kind === 'bad';
+    btn.classList.toggle('alert', !!bad);
+  }
+}
+
+function ago(ts) {
+  if (!ts) return '从未';
+  const d = Math.floor(Date.now() / 1000 - ts);
+  if (d < 60) return '刚刚';
+  if (d < 3600) return Math.floor(d / 60) + ' 分钟前';
+  if (d < 86400) return Math.floor(d / 3600) + ' 小时前';
+  return Math.floor(d / 86400) + ' 天前';
+}
+
+async function loadStatus() {
+  try {
+    const res = await fetch('/api/status');
+    STATUS = await res.json();
+  } catch (_) {
+    return; // 状态条只是锦上添花，取不到不该影响主流程
+  }
+  renderHealth();
+  renderFirstRun();
+  const st = STATUS.state || {};
+  const errs = st.last_sync_errors || [];
+  const btn = document.getElementById('healthBtn');
+  if (btn) btn.classList.toggle('alert', errs.length > 0);
+  if (errs.length) {
+    setStatus(`${errs.length} 个数据源上次采集失败 · 点「数据源」查看`, 'warn');
+  } else if (st.last_sync_at && document.getElementById('status').textContent.startsWith('已加载')) {
+    setStatus(`已加载 ${(STATUS.records || 0).toLocaleString()} 条 · 上次同步 ${ago(st.last_sync_at)}`, 'ok');
+  }
+  const v = document.getElementById('versionTag');
+  if (v) v.textContent = 'v' + (STATUS.version || '');
+}
+
+function renderHealth() {
+  const el = document.getElementById('healthPanel');
+  if (!el || !STATUS) return;
+  const st = STATUS.state || {};
+  const errs = {};
+  (st.last_sync_errors || []).forEach(e => { errs[e.source] = e.message; });
+  const rows = (STATUS.sources || []).map(s => {
+    const cls = errs[s.id] ? 'dot-err' : s.present ? 'dot-ok' : 'dot-off';
+    const title = errs[s.id] ? `title="${esc(errs[s.id])}"`
+              : s.present ? '' : 'title="本机未检测到该工具的日志目录"';
+    const path = s.present ? `<span class="path">${esc(s.path || '')}</span>`
+                            : `<span class="path">未检测到</span>`;
+    return `<div class="health-row" ${title}><span class="dot ${cls}"></span>` +
+           `<span class="name">${esc(s.label)}</span>${path}</div>`;
+  }).join('');
+  const errLines = Object.keys(errs).length
+    ? '<div class="health-note health-err">' +
+      Object.keys(errs).map(k => `⚠ ${esc(SRC_NAMES[k] || k)}：${esc(errs[k])}`).join('<br>') +
+      '</div>'
+    : '';
+  const idx = STATUS.index || {};
+  el.innerHTML =
+    `<h3>数据源</h3>${rows}` +
+    errLines +
+    `<div class="health-foot">` +
+    `记录 ${(STATUS.records || 0).toLocaleString()} 条 · 索引 ${(idx.docs || 0).toLocaleString()} 篇对话<br>` +
+    `上次同步 ${st.last_sync_at ? ago(st.last_sync_at) : '从未'}` +
+    `${st.last_sync_duration_ms != null ? ` · 耗时 ${(st.last_sync_duration_ms / 1000).toFixed(1)}s` : ''}<br>` +
+    `数据文件 ${esc(STATUS.data_file || '')}` +
+    `</div>`;
+}
+
+function toggleHealth(ev) {
+  if (ev) ev.stopPropagation();
+  const el = document.getElementById('healthPanel');
+  const btn = document.getElementById('healthBtn');
+  const open = el.classList.toggle('hidden');
+  btn.setAttribute('aria-expanded', String(!open));
+}
+
+// 点别处收起健康面板
+document.addEventListener('click', ev => {
+  const el = document.getElementById('healthPanel');
+  if (!el || el.classList.contains('hidden')) return;
+  if (!el.contains(ev.target)) {
+    el.classList.add('hidden');
+    document.getElementById('healthBtn').setAttribute('aria-expanded', 'false');
+  }
+});
+
+function renderFirstRun() {
+  const el = document.getElementById('firstRun');
+  const found = document.getElementById('firstRunFound');
+  if (!el || !STATUS) return;
+  const present = (STATUS.sources || []).filter(s => s.present);
+  const fleet = document.getElementById('dataScope').value === 'fleet';
+  const empty = (STATUS.records || 0) === 0;
+  const dismissed = localStorage.getItem('tb.firstrun.dismissed') === '1';
+  if (fleet || !(empty && !dismissed)) { el.classList.add('hidden'); return; }
+  el.classList.remove('hidden');
+  found.innerHTML = present.length
+    ? present.map(s => `<span class="found-chip"><span class="dot dot-ok"></span>${esc(s.label)}</span>`).join('')
+    : '<span class="found-chip"><span class="dot dot-off"></span>本机没有检测到任何 agent 日志目录</span>';
+}
+
+function dismissFirstRun() {
+  localStorage.setItem('tb.firstrun.dismissed', '1');
+  document.getElementById('firstRun').classList.add('hidden');
+}
+
+/* ---------- 导出 CSV ----------
+   从已经渲染出来的表格取数，和屏幕上看到的完全一致（含当前筛选与排序），
+   不必再开一套后端导出接口。 */
+function exportTable(id, label) {
+  const table = document.getElementById(id);
+  if (!table) return;
+  const rows = [...table.querySelectorAll('tr')].map(tr =>
+    [...tr.children].map(td => {
+      const clone = td.cloneNode(true);
+      clone.querySelectorAll('button, svg, input, .share-bar').forEach(n => n.remove());
+      return '"' + clone.textContent.trim().replace(/"/g, '""') + '"';
+    }).join(','));
+  if (rows.length < 2) { setStatus('这张表还没有数据可导出', 'warn'); return; }
+  // 前置 UTF-8 BOM：没有它，Excel 会把中文按本地编码猜成乱码。
+  const blob = new Blob(['\ufeff' + rows.join('\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `tokenbuddy-${label}-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  setStatus(`已导出 ${label}（${rows.length - 1} 行 CSV）`, 'ok');
+}
+
 /* ---------- 视图切换（统计 / 搜索 两个独立页面） ---------- */
+// 进入搜索页 = 明确的意图：先把索引在后台建起来，用户打完字就已经能搜。
+function activateContext() {
+  fetch('/api/context/activate', { method: 'POST' }).catch(() => {});
+  loadContextStats();
+}
+
 function switchView(v) {
-  document.querySelectorAll('.nav-item').forEach(a => a.classList.toggle('active', a.dataset.view === v));
+  if (v === 'search') activateContext();
+  document.querySelectorAll('.nav-item').forEach(a => {
+    const on = a.dataset.view === v;
+    a.classList.toggle('active', on);
+    a.setAttribute('aria-selected', String(on));
+  });
   document.getElementById('viewStats').classList.toggle('hidden', v !== 'stats');
   document.getElementById('viewSearch').classList.toggle('hidden', v !== 'search');
   window.scrollTo({ top: 0, behavior: 'instant' });
@@ -1982,11 +2716,28 @@ async function renderDdSuggest(q) {
 }
 
 document.querySelectorAll('.tab').forEach(btn => btn.addEventListener('click', () => {
-  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(b => {
+    b.classList.remove('active');
+    b.setAttribute('aria-selected', 'false');
+    b.tabIndex = -1;
+  });
   document.querySelectorAll('.tabview').forEach(v => v.classList.add('hidden'));
   btn.classList.add('active');
+  btn.setAttribute('aria-selected', 'true');
+  btn.tabIndex = 0;
   document.getElementById('tab-' + btn.dataset.tab).classList.remove('hidden');
 }));
+// 左右方向键在 tablist 里移动焦点（WAI-ARIA 的标准键盘模式）
+document.querySelector('.tabs').addEventListener('keydown', e => {
+  if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+  const tabs = [...document.querySelectorAll('.tab')];
+  const i = tabs.indexOf(document.activeElement);
+  if (i < 0) return;
+  e.preventDefault();
+  const next = tabs[(i + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
+  next.focus();
+  next.click();
+});
 document.getElementById('ctxQuery').addEventListener('keydown', e => { if (e.key === 'Enter') runContextSearch(); });
 document.getElementById('ctxQuery').addEventListener('input', () => {
   updateCtxClear();
@@ -2012,6 +2763,8 @@ document.addEventListener('keydown', e => {
 });
 document.getElementById('timeRange').addEventListener('change', loadAll);
 document.getElementById('source').addEventListener('change', loadAll);
+document.getElementById('dataScope').addEventListener('change', applyDataScope);
+document.getElementById('fleetHost').addEventListener('change', loadFleet);
 document.getElementById('modelFilter').addEventListener('input', () => { clearTimeout(window.__dt); window.__dt = setTimeout(loadAll, 300); });
 document.getElementById('timelineMode').addEventListener('change', async () => {
   const res = await fetch('/api/timeline?' + filterParams({ mode: document.getElementById('timelineMode').value }));
@@ -2040,6 +2793,218 @@ document.getElementById('ctxSnippet').addEventListener('change', e => { savePref
 renderRecentInto('ctxRecent', recentToSearch);
 loadAll();
 loadContextStats();
+loadStatus();
+</script>
+<script>
+/* ---------- R23: client-side i18n ----------
+   Chinese in markup/JS is the source of truth; English is applied at the
+   DOM level from the dictionaries below. Two tiers on purpose:
+   - exact: whole (trimmed) text node / attribute value matches;
+   - prefix: “label：<dynamic tail>” patterns where the English label can
+     lead and the raw tail follows — only when the order stays readable.
+   Interpolated sentences with the varying part in the middle stay Chinese:
+   substring swapping CJK→English breaks word order, and a broken sentence
+   is worse than a foreign one. The MutationObserver re-applies to
+   dynamically rendered subtrees, so JS-generated chrome is covered without
+   touching any render function; translated output never matches a key, so
+   the observer converges after one extra no-write pass. */
+const I18N = {
+  "统计":"Stats", "搜索":"Search", "概览":"Overview", "数据":"Data", "速览":"At a glance",
+  "Fleet 多机":"Fleet", "Fleet 多机总账":"Fleet combined bill",
+  "Local-first · Token 管理台":"Local-first · Token console",
+  "TokenBuddy · Token 管理台":"TokenBuddy · Token console",
+  "Token 总量":"Total tokens", "请求数":"Requests", "平均耗时":"Avg latency", "P95 耗时":"P95 latency",
+  "Cache 读":"Cache read", "Cache 写":"Cache write", "Cache 命中":"Cache hit",
+  "Token 份额（Top 12 模型）":"Token share (top 12 models)",
+  "Token 时间线 · 按来源堆叠":"Token timeline · stacked by source",
+  "Top 模型 Tokens":"Top models by tokens",
+  "工作节奏 · 按小时（中国时间）":"Work rhythm · by hour (China time)",
+  "横轴 0–23 点 · 柱高为该小时的 token 总量，悬停查看请求数":"X axis 0–23 · bar height is that hour's token total; hover for request counts",
+  "按小时的 token 用量柱状图，完整数字见下方会话与来源明细表":"Hourly token bars; exact numbers in the session and source tables below",
+  "每日缓存命中率趋势折线图，完整数字见下方表格":"Daily cache-hit-rate trend; exact numbers in the table below",
+  "缓存效率趋势":"Cache efficiency trend",
+  "会话 Top 榜":"Top sessions", "模型对比":"Model comparison", "模型对比明细":"Model comparison detail",
+  "模型热力图":"Model heatmaps", "模型 × 日期":"Model × date", "模型 × 来源":"Model × source",
+  "主机 × 来源":"Host × source", "主机":"Host", "各机明细":"Per-host detail", "本机":"This machine",
+  "上下文水位":"Context fill", "水位":"Fill", "还剩多少":"Headroom", "份额":"Share",
+  "用量时间线":"Usage timeline", "来源对比":"Source comparison", "来源 Tokens":"Source tokens",
+  "深度分析":"Deep analysis", "明细表":"Detail tables", "数据源":"Sources", "数据源状态":"Source status",
+  "同步数据":"Sync data", "增量同步":"Incremental sync", "全量重建":"Full rebuild",
+  "重新采集全部日志并重建索引":"Re-collect all logs and rebuild the index",
+  "刷新":"Refresh", "同步":"Sync", "保存":"Save", "清空":"Clear", "测试连接":"Test connection",
+  "⚙ 配置":"⚙ Config", "RustFS / Fleet 配置":"RustFS / Fleet config",
+  "保存写入 ~/.tokenbuddy/fleet.toml（0600）；secret_key 只写不读，页面永远拿不到明文。":"Saves to ~/.tokenbuddy/fleet.toml (0600); secret_key is write-only — this page never sees plaintext.",
+  "secret_key（留空 = 保持不变）":"secret_key (empty = keep current)",
+  "auto_push（每小时后台推送，重启后生效）":"auto_push (hourly background push; takes effect after restart)",
+  "host_id（留空 = 本机主机名）":"host_id (empty = this machine's hostname)",
+  "path_style（RustFS/MinIO 用 true）":"path_style (true for RustFS/MinIO)",
+  "启用 Fleet（写入 enabled = true）":"Enable Fleet (writes enabled = true)",
+  "汇聚的是各机 token 账单（data.parquet），对话全文 context.parquet 不参与推送。首次使用：点「⚙ 配置」填入 RustFS 地址与密钥，或手动创建 ~/.tokenbuddy/fleet.toml。":"Fleet aggregates each machine's token bill (data.parquet); full conversation text (context.parquet) is never pushed. First time: open ⚙ Config and enter your RustFS address and keys, or create ~/.tokenbuddy/fleet.toml by hand.",
+  "每行一台主机；数字来自各机推送的 data.parquet，与该机本机视图口径一致":"One row per host; numbers come from each host's pushed data.parquet, same accounting as its local view",
+  "只看一台主机":"Focus one host", "全部主机":"All hosts", "本机数据或 Fleet 多机汇聚":"Local data or Fleet aggregation",
+  "推送":"Push", "拉取":"Pull",
+  "加载中…":"Loading…", "同步中…":"Syncing…", "保存中…":"Saving…", "测试连接中…":"Testing connection…",
+  "还没有导入任何数据":"No data imported yet", "先看看界面":"Just look around", "导入数据":"Import data",
+  "全部来源":"All sources", "全部工程":"All projects", "全部时间":"All time", "全部角色":"All roles",
+  "分析范围":"Analysis range", "今天":"Today", "近 7 天":"Last 7 days", "近 14 天":"Last 14 days",
+  "近 30 天":"Last 30 days", "近 90 天":"Last 90 days", "按天":"Daily", "按周":"Weekly",
+  "按小时":"Hourly", "按月":"Monthly", "按来源":"By source", "按模型（Top 用量）":"By model (top usage)",
+  "按工程（会话所在目录）过滤":"Filter by project (the session's working directory)",
+  "按模型过滤…":"Filter models…", "指标:":"Metric:", "维度:":"Dimension:", "跨度":"Span",
+  "按 token 总量排序；token 被工具掩码的来源（Qoder）按 credits 参与；标「无计量」的是 BYOK 会话——只有运行日志计数，无任何账单记录；点击会话可展开对话":"Sorted by total tokens; sources whose host masks token counts (Qoder) rank by credits; rows marked “unmetered” are BYOK sessions — runtime log counts only, no billing record of any kind; click a session to expand the conversation",
+  "总计":"Total", "平均 TTFT":"Avg TTFT", "平均输入":"Avg input", "平均输出":"Avg output", "输出/输入":"Out/in",
+  "工具调用":"Tool calls", "用户提问":"User prompts", "AI 回复":"AI replies", "提问":"Prompts", "用户":"User",
+  "会话":"Sessions", "高":"High", "低":"Low", "Cache 命中率":"Cache hit rate", "模型数":"Models",
+  "当前过滤范围内":"In the current filter",
+  "输入侧命中缓存":"Input served from cache", "输入侧命中缓存比例":"Share of input served from cache",
+  "3 行摘要":"3-line digest", "摘要全文":"Full text", "摘要显示方式":"Digest detail",
+  "结果排序方式":"Sort results", "按相关度":"By relevance", "最新优先":"Newest first", "最早优先":"Oldest first",
+  "返回结果数量":"Results to return", "10 条":"10", "20 条":"20", "30 条":"30", "50 条":"50", "100 条":"100",
+  "搜索全部 AI 对话内容":"Search all AI conversation content", "搜索（快捷键 /）":"Search (press /)",
+  "主视图切换":"Switch main view", "统计视图切换":"Switch stats view",
+  "↻ 重建索引":"↻ Rebuild index", "检索质量加载中…":"Loading search quality…",
+  "模型":"Model", "来源":"Source",
+  "28 天内窗口样本不足":"Not enough 5h-window samples in 28 days",
+  "无计量":"Unmetered", "未检测到":"Not detected", "历史记录":"History", "记录":"History",
+  "刚刚":"just now", "分钟前":"m ago", "小时前":"h ago", "天前":"d ago", "从未":"never",
+  "就绪":"Ready", "已加载":"Loaded", "失败":"Failed", "✓ 已复制":"✓ Copied", "✗ 失败":"✗ Failed",
+  "正在建索引":"Building index", "正在采集日志":"Collecting logs",
+  "暂无数据":"No data", "该窗口暂无数据":"No data in this window",
+  "当前过滤范围没有数据":"No data in the current filter",
+  "当前过滤范围没有主机数据":"No host data in the current filter",
+  "当前过滤范围内没有上报上下文水位的请求（该指标来自 Qoder）":"No context-fill-reporting requests in the current filter (the metric comes from Qoder)",
+  "当前过滤范围没有带会话 id 的记录":"No records with a session id in the current filter",
+  "这张表还没有数据可导出":"Nothing to export in this table yet",
+  "（无标题会话）":"(untitled session)", "最近搜索":"Recent searches",
+  "暂无最近搜索":"No recent searches", "暂无搜索记录":"No search history",
+  "载入对话…":"Loading conversation…", "载入会话…":"Loading session…",
+  "点击展开对话":"Click to expand the conversation",
+  "点击记录：这条结果帮到了你":"Click to record: this result helped",
+  "复制本条内容":"Copy this result", "复制这条消息":"Copy this message",
+  "复制全部结果为纯文本":"Copy all results as plain text",
+  "复制跳转命令 claude --resume":"Copy resume command: claude --resume",
+  "复制跳转命令 mimocode -s":"Copy resume command: mimocode -s",
+  "复制跳转命令 opencode -s":"Copy resume command: opencode -s",
+  "复制跳转命令 pi --session":"Copy resume command: pi --session",
+  "复制跳转命令 zcode -s":"Copy resume command: zcode -s",
+  "⧉ 复制会话 ID":"⧉ Copy session ID", "复制会话 ID":"Copy session ID",
+  "导出为 Markdown 文件":"Export as Markdown", "仅看用户提问":"Prompts only",
+  "内容超长，仅索引前段":"Content too long; only the head is indexed",
+  "本机没有检测到任何 agent 日志目录":"No agent log directories detected on this machine",
+  "索引状态不可用":"Index status unavailable", "尚未构建":"Not built yet",
+  "检索质量：日志不可读":"Search quality: logs unreadable",
+  "暂无燃速":"No burn rate yet", "已超过你自己的 P90 节奏":"Above your own P90 pace already",
+  "窗口内没有缓存命中记录":"No cache hits recorded in this window",
+  "总量持平":"Flat vs previous period", "vs 上期":"vs previous period",
+  "— 无上期基线":"— no previous-period baseline",
+  "5h 窗口":"5h window", "最近 5 小时没有请求——无打开的窗口":"No requests in the last 5 hours — no open window",
+  "● 重建已启动…":"● Rebuild started…",
+  "（需采集全部日志，完成后自动可搜）":"(all logs are re-collected; search comes back automatically when it finishes)",
+  "● 索引未构建":"● Index not built",
+  "（只用统计的话它不会占用内存；进入搜索页时自动构建，或点「↻ 重建索引」）":"(statistics-only use never builds it; it builds when you open search, or hit ↻ Rebuild index)",
+  "未知错误":"unknown error", "无工程":"no project",
+  "尚无主机数据——先在各机启用 Fleet 并推送，再点 ⤓ Sync now":"No host data yet — enable Fleet on each machine and push, then hit ⤓ Sync now",
+  "本机未检测到该工具的日志目录":"No local log directory detected for this tool",
+  "BYOK 会话：模型调用直连自己的密钥，Qoder 无任何计量记录，仅有运行日志计数":"BYOK session: model calls bill to your own key; Qoder keeps no metering record, only runtime log counts",
+  "▸ 查看详情":"▸ Details", "▾ 收起":"▾ Collapse",
+  "项目 × 模型透视":"Project × model pivot", "占该工程":"% of project", "工程":"Project",
+
+  "「哪个项目在烧 token」的事实答案：归因只来自来源日志的确定性字段（如 cwd），未归因的行以 — 显示。":"The factual answer to “which project burns the tokens”: attribution comes only from deterministic fields in each source's logs (e.g. cwd); unattributed rows show —.",
+    "支持语法：":"Syntax: ",
+  "——语法优先于上方筛选器":" — syntax overrides the filters above",
+  "project:目录名":"project:dirname", "-排除词":"-excluded", '"精确短语"':'"exact phrase"',
+"⧉ 复制全部":"⧉ Copy all", "↧ 导出 Markdown":"↧ Export Markdown", "⧉ 复制":"⧉ Copy",
+  "近":"Last", "天 vs 上一个周期":"days vs previous period",
+  "TokenBuddy v0.5.0 · 数据来自 Claude / OpenCode / Mimo / Zcode / Pi / Qoder / WorkBuddy / MiniMax / Hermes 本地日志":"TokenBuddy · data from local Claude / OpenCode / Mimo / Zcode / Pi / Qoder / WorkBuddy / MiniMax / Hermes logs"
+};
+const I18N_PREFIX = {
+  "搜索失败：":"Search failed: ", "载入失败：":"Load failed: ", "加载失败：":"Load failed: ",
+  "保存失败：":"Save failed: ", "连接失败：":"Connection failed: ", "同步失败：":"Sync failed: ",
+  "读取配置失败：":"Failed to read config: ", "Fleet 加载失败:":"Failed to load fleet: ",
+  "推送完成：":"Pushed: ", "查询：":"Query: ", "标题：":"Title: ",
+  "数据文件 ":"Data file ", "当前配置：":"Current config: ", "上次同步 ":"Last sync ",
+  "会话 ":"Session ", "● 索引失败：":"● Index build failed: ", "同步中… ":"Syncing… "
+};
+function tbLang() {
+  try {
+    return localStorage.getItem('tb_lang') ||
+      ((navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en');
+  } catch (e) { return 'zh'; }
+}
+/* Tier 3 — anchored full-node patterns for “template with the number in
+   the middle”. ^…$ anchoring means a pattern only ever claims a node it
+   fully understands; anything else falls through untouched. */
+const I18N_PATTERNS = [
+  [/^已加载 ([\d,]+) 条记录$/, m => `Loaded ${m[1]} records`],
+  [/^已加载 ([\d,]+) 条 · 上次同步 (.+)$/, m => `Loaded ${m[1]} records · last sync ${m[2]}`],
+  [/^记录 ([\d,]+) 条 · 索引 ([\d,]+) 篇对话$/, m => `${m[1]} records · ${m[2]} indexed turns`],
+  [/^输入 (.+) · 输出 (.+)$/, m => `in ${m[1]} · out ${m[2]}`],
+  [/^缓存读 (.+) · 写 (.+)$/, m => `cache read ${m[1]} · written ${m[2]}`],
+  [/^平均耗时 (.+)$/, m => `avg latency ${m[1]}`],
+  [/^命中 (\d+) 条 · 耗时 (.+)$/, m => `${m[1]} hits · ${m[2]}`],
+  [/^(\d+) 条命中 · 耗时 (.+)$/, m => `${m[1]} hits · ${m[2]}`],
+  [/^窗口内缓存承接输入 (.+) tokens（原始事实，未折算）$/, m => `Cache absorbed ${m[1]} tokens of input in this window (raw fact, no conversion)`],
+  [/^窗口平均 (.+)（来源上报的上下文窗口占比；当前仅 Qoder 提供）$/, m => `Window avg ${m[1]} (source-reported context-window share; Qoder only for now)`],
+  [/^窗口 P90 参考 (.+) · 28日峰值 (.+)$/, m => `Window P90 reference ${m[1]} · 28-day peak ${m[2]}`],
+  [/^按当前燃速 (.+)\/h,约 (.+) 到达 P90 节奏$/, m => `At the current burn rate ${m[1]}/h, P90 pace in ${m[2]}`],
+  [/^(\d{4}-\d{2}-\d{2})\n(.+) tokens · ([\d,]+) 请求$/, m => `${m[1]} ${m[2]} tokens · ${m[3]} requests`],
+  [/^(\d{4}-\d{2}-\d{2}) (.+) tokens · ([\d,]+) 请求$/, m => `${m[1]} ${m[2]} tokens · ${m[3]} requests`],
+  [/^(\d{1,2}):00–(\d{1,2}):59\n(.+) tokens · ([\d,]+) 请求$/, m => `${m[1]}:00–${m[2]}:59 ${m[3]} tokens · ${m[4]} requests`],
+  [/^([\w./:-]+): (.+) tokens · ([\d,]+) 请求$/, m => `${m[1]}: ${m[2]} tokens · ${m[3]} requests`],
+  [/^检索质量 · 共 (\d+) 次查询 · 零返回 (\d+) \((.+)%\) · tier3 兜底 (\d+) · p50 (.+?)ms \/ p95 (.+?)ms(.*)$/, m => `Search quality · ${m[1]} queries · ${m[2]} zero-return (${m[3]}%) · tier3 fallback ${m[4]} · p50 ${m[5]}ms / p95 ${m[6]}ms${m[7].replace(/最近坏查询:\s*/, ' · recent failing queries: ').replace(/\((\d+)条\)/g, '($1 hits)')}`],
+  [/^(\d+) 条命中 · tier (.+?) · 有效词 (.+?) · 候选池 (.+?) · 验证 (.+?) · 耗时 (.+)$/, m => `${m[1]} hits · tier ${m[2]} · effective terms ${m[3]} · pool ${m[4]} · verified ${m[5]} · ${m[6].replace(/· 已合并 (\d+) 条近似回复/g, '· $1 near-duplicates merged').replace(/· 软AND兜底 (\d+)/g, '· soft-AND backfill $1')}`],
+  [/^(.+) · 会话 ([0-9a-zA-Z_-]{8,})$/, m => `${m[1]} · session ${m[2]}`],
+  [/^⚠ (.+?) 用量 (.+)，偏离同星期基线 (.+)（稳健 z=(.+?)）。近 (\d+) 天共 (\d+) 个异常日。$/, m => `⚠ ${m[1]} usage ${m[2]}, off the same-weekday baseline ${m[3]} (robust z=${m[4]}). ${m[5]} days audited, ${m[6]} anomalous.`]
+];
+function translateOne(text) {
+  const c = text.trim();
+  if (!c) return null;
+  if (I18N[c]) return text.replace(c, I18N[c]);
+  for (const [re, fn] of I18N_PATTERNS) {
+    const m = c.match(re);
+    if (m) return text.replace(c, fn(m));
+  }
+  for (const k in I18N_PREFIX) {
+    if (c.startsWith(k)) return text.replace(c, I18N_PREFIX[k] + c.slice(k.length));
+  }
+  return null;
+}
+function applyI18n() {
+  if (tbLang() !== 'en') return;
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const t = translateOne(n.nodeValue);
+    if (t !== null) n.nodeValue = t;
+  }
+  for (const el of document.querySelectorAll('[placeholder],[title],[aria-label]')) {
+    for (const a of ['placeholder', 'title', 'aria-label']) {
+      const v = el.getAttribute(a);
+      if (!v) continue;
+      const t = translateOne(v);
+      if (t !== null) el.setAttribute(a, t);
+    }
+  }
+}
+function toggleLang(ev) {
+  if (ev) ev.preventDefault();
+  try {
+    localStorage.setItem('tb_lang', tbLang() === 'en' ? 'zh' : 'en');
+  } catch (e) { /* private mode: toggle still works for this page view */ }
+  location.reload();
+}
+(function () {
+  const btn = document.getElementById('langToggle');
+  if (btn) btn.textContent = tbLang() === 'en' ? '中' : 'EN';
+  let queued = false;
+  new MutationObserver(() => {
+    if (queued) return;
+    queued = true;
+    /* microtask, not rAF: background tabs throttle rAF to a stop, which
+       would starve translation of nodes rendered while hidden */
+    queueMicrotask(() => { queued = false; applyI18n(); });
+  }).observe(document.body, { childList: true, subtree: true, characterData: true });
+  applyI18n();
+})();
 </script>
 </body>
 </html>

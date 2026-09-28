@@ -1,4 +1,4 @@
-use crate::{claude, mimo, minimax, opencode, qoder, workbuddy, zcode, TokenRecord};
+use crate::{claude, hermes, mimo, minimax, opencode, pi, qoder, workbuddy, zcode, TokenRecord};
 use anyhow::Result;
 use arrow::array::{
     Array, Float64Array, Float64Builder, Int64Array, Int64Builder, RecordBatch, StringArray,
@@ -16,6 +16,16 @@ use std::sync::Arc;
 
 /// How many pre-rebuild snapshots `sync_full` retains.
 const SNAPSHOT_KEEP: usize = 5;
+
+/// One collector's failure during a sync round. Sync is fault-tolerant per
+/// source: a locked or corrupt tool database costs the user that source's
+/// rows, not every other source's, and says so here instead of failing the
+/// whole run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceError {
+    pub source: String,
+    pub message: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncResult {
@@ -36,6 +46,54 @@ pub struct SyncResult {
     pub workbuddy_skipped: u32,
     pub minimax_imported: u32,
     pub minimax_skipped: u32,
+    pub hermes_imported: u32,
+    pub hermes_skipped: u32,
+    pub codex_imported: u32,
+    pub codex_skipped: u32,
+    pub gemini_imported: u32,
+    pub gemini_skipped: u32,
+    pub qwen_imported: u32,
+    pub qwen_skipped: u32,
+    /// Sources that failed this round; empty on a clean run.
+    pub errors: Vec<SourceError>,
+    /// Rows the store held before a full rebuild. A rebuild re-derives from
+    /// whatever logs still exist, so this is the number history can shrink
+    /// by — reported so the UI never claims a rebuild "added" rows while the
+    /// total quietly fell.
+    pub previous_total: Option<u64>,
+    /// Rows the store holds now.
+    pub total_after: u64,
+    /// Wall-clock cost of the round, milliseconds.
+    pub duration_ms: u64,
+    /// `incremental` or `full`, as the caller asked for it.
+    pub mode: String,
+}
+
+/// What one collector can see on this machine, for the dashboard's health
+/// panel: present or not, and where it looked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceHealth {
+    pub id: String,
+    pub label: String,
+    pub present: bool,
+    pub path: Option<String>,
+}
+
+/// Wall-clock facts about the last completed sync, persisted next to the
+/// parquet so "上次同步 3 分钟前" survives a restart instead of being
+/// reconstructed from nothing on the dashboard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncState {
+    #[serde(default)]
+    pub last_sync_at: Option<i64>,
+    #[serde(default)]
+    pub last_sync_mode: Option<String>,
+    #[serde(default)]
+    pub last_sync_imported: Option<u32>,
+    #[serde(default)]
+    pub last_sync_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub last_sync_errors: Vec<SourceError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +107,8 @@ pub struct Summary {
     /// Raw host-reported credits for the window. This is the exact consumption
     /// figure for sources whose token counts are masked (Qoder).
     pub total_credits: f64,
+    /// Mean context-window fill over reporting requests in the whole window.
+    pub avg_context_ratio: Option<f64>,
     pub by_source: Vec<SourceRow>,
     pub by_model: Vec<ModelRow>,
 }
@@ -99,6 +159,7 @@ pub struct TimelineBucket {
     pub qoder_tokens: u64,
     pub workbuddy_tokens: u64,
     pub minimax_tokens: u64,
+    pub hermes_tokens: u64,
 }
 
 /// Per-model comparison row used by the `/api/models` report.
@@ -125,6 +186,11 @@ pub struct ModelStat {
     /// Aggregate throughput: total output tokens / total duration seconds.
     pub tokens_per_sec: Option<f64>,
     pub cache_hit_rate: Option<f64>,
+    /// Hosts (Fleet aggregation only) that issued requests to this model;
+    /// empty for the single-machine endpoint, and skipped in that case so
+    /// the local JSON shape stays byte-identical to before Fleet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
 }
 
 /// Response shape for `/api/models`.
@@ -132,6 +198,81 @@ pub struct ModelStat {
 pub struct ModelComparison {
     /// Sorted by total_tokens descending.
     pub models: Vec<ModelStat>,
+}
+
+// --- Fleet (multi-machine aggregation over pulled host parquets) ---
+
+/// Response shape for `/api/fleet/summary`: fleet-wide totals, one row per
+/// host, and the host × source matrix behind the fleet heatmap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetSummary {
+    pub totals: FleetTotals,
+    /// Sorted by host id; only hosts whose parquet is pulled locally appear.
+    pub by_host: Vec<FleetHostRow>,
+    /// One cell per (host, source) with any activity in the window.
+    pub host_source: Vec<FleetHostSourceCell>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetTotals {
+    /// Hosts contributing to this window (after the host filter).
+    pub hosts: usize,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+    pub credits: f64,
+    /// cache_read / (input + cache_read) across the fleet, same convention
+    /// as the dashboard's local cache-hit figure.
+    pub cache_hit_rate: Option<f64>,
+    pub avg_context_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetHostRow {
+    pub host: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+    pub credits: f64,
+    pub avg_context_ratio: Option<f64>,
+    /// Sources seen on this host in the window (for quick scanning).
+    pub sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetHostSourceCell {
+    pub host: String,
+    pub source: String,
+    pub requests: u64,
+    pub total_tokens: u64,
+    pub credits: f64,
+}
+
+/// Response shape for `/api/fleet/metrics`: the local latency/cache panel
+/// re-keyed by host instead of source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetMetrics {
+    pub by_host: Vec<FleetHostMetrics>,
+    /// Same totals shape as the single-machine `/api/metrics`.
+    pub totals: TotalsMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetHostMetrics {
+    pub host: String,
+    pub requests: u64,
+    pub avg_duration_ms: Option<f64>,
+    pub avg_ttft_ms: Option<f64>,
+    pub cache_hit_rate: Option<f64>,
+    pub output_input_ratio: Option<f64>,
+    pub avg_input_per_req: f64,
+    pub avg_output_per_req: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,13 +436,17 @@ fn parquet_schema() -> SchemaRef {
         Field::new("context_ratio", DataType::Float64, false),
         Field::new("timestamp", DataType::Int64, false),
         Field::new("session_id", DataType::Utf8, true),
+        // R14: project attribution from the source log (cwd / workspace
+        // directory / project slug). Null for rows collected before the
+        // column existed and for sources that do not say.
+        Field::new("project", DataType::Utf8, true),
         Field::new("message_id", DataType::Utf8, false),
         Field::new("duration_ms", DataType::Int64, true),
         Field::new("ttft_ms", DataType::Int64, true),
     ]))
 }
 
-fn records_to_batch(records: &[(String, TokenRecord)]) -> RecordBatch {
+pub(crate) fn records_to_batch(records: &[(String, TokenRecord)]) -> RecordBatch {
     let s = parquet_schema();
     let n = records.len();
     let mut source_b = StringBuilder::with_capacity(n, n * 10);
@@ -314,6 +459,7 @@ fn records_to_batch(records: &[(String, TokenRecord)]) -> RecordBatch {
     let mut ratio_b = Float64Builder::with_capacity(n);
     let mut ts_b = Int64Builder::with_capacity(n);
     let mut sid_b = StringBuilder::with_capacity(n, n * 40);
+    let mut proj_b = StringBuilder::with_capacity(n, n * 60);
     let mut mid_b = StringBuilder::with_capacity(n, n * 50);
     let mut dur_b = Int64Builder::with_capacity(n);
     let mut ttft_b = Int64Builder::with_capacity(n);
@@ -331,6 +477,11 @@ fn records_to_batch(records: &[(String, TokenRecord)]) -> RecordBatch {
         match &r.session_id {
             Some(s) => sid_b.append_value(s),
             None => sid_b.append_null(),
+        }
+        if r.project.is_empty() {
+            proj_b.append_null();
+        } else {
+            proj_b.append_value(&r.project);
         }
         mid_b.append_value(mid);
         match r.duration_ms {
@@ -356,6 +507,7 @@ fn records_to_batch(records: &[(String, TokenRecord)]) -> RecordBatch {
             Arc::new(ratio_b.finish()),
             Arc::new(ts_b.finish()),
             Arc::new(sid_b.finish()),
+            Arc::new(proj_b.finish()),
             Arc::new(mid_b.finish()),
             Arc::new(dur_b.finish()),
             Arc::new(ttft_b.finish()),
@@ -392,7 +544,7 @@ fn read_existing_ids(path: &Path) -> Result<HashSet<String>> {
     Ok(ids)
 }
 
-fn write_parquet(path: &Path, batch: &RecordBatch) -> Result<()> {
+pub(crate) fn write_parquet(path: &Path, batch: &RecordBatch) -> Result<()> {
     let tmp = path.with_extension("parquet.tmp");
     let file = std::fs::File::create(&tmp)?;
     let mut writer = ArrowWriter::try_new(file, batch.schema(), None)?;
@@ -402,15 +554,128 @@ fn write_parquet(path: &Path, batch: &RecordBatch) -> Result<()> {
     Ok(())
 }
 
+/// Run one collector, degrading to "no rows plus a reported error" instead of
+/// aborting the round. Without this, one locked tool database voided the
+/// import of every other source — the failure mode that makes a local
+/// analytics tool look broken for reasons the dashboard cannot explain.
+fn collect_or_report<F>(collect: F, name: &str, errors: &mut Vec<SourceError>) -> Vec<TokenRecord>
+where
+    F: FnOnce() -> Result<Vec<TokenRecord>>,
+{
+    match collect() {
+        Ok(records) => records,
+        Err(e) => {
+            // `{e:#}` walks the whole anyhow context chain: a bare "database
+            // is locked" does not say which database, and the panel this
+            // lands in is the user's only clue.
+            let message = format!("{e:#}");
+            eprintln!("[TokenBuddy] {name} collection failed: {message}");
+            errors.push(SourceError {
+                source: name.to_string(),
+                message,
+            });
+            Vec::new()
+        }
+    }
+}
+
+/// Rows this round added, summed across every source. Named once so the CLI,
+/// the dashboard status line and the persisted state can never quote three
+/// different numbers for the same run.
+pub fn imported_total(result: &SyncResult) -> u32 {
+    result.claude_imported
+        + result.opencode_imported
+        + result.mimo_imported
+        + result.zcode_imported
+        + result.pi_imported
+        + result.qoder_imported
+        + result.workbuddy_imported
+        + result.minimax_imported
+        + result.hermes_imported
+        + result.codex_imported
+        + result.gemini_imported
+        + result.qwen_imported
+}
+
+/// Row count straight from the parquet footer, without reading any column
+/// data. 0 when the file does not exist yet.
+/// True when the parquet file at `path` opens far enough to read its footer.
+fn parquet_opens(path: &Path) -> bool {
+    std::fs::File::open(path)
+        .ok()
+        .and_then(|file| ParquetRecordBatchReaderBuilder::try_new(file).ok())
+        .is_some()
+}
+
+/// Newest `data.<stamp>.snap.parquet` in `dir` that actually opens. The
+/// timestamped names sort lexicographically == chronologically, so the last
+/// readable one is the freshest usable backup.
+fn newest_readable_snapshot(dir: &Path) -> Option<PathBuf> {
+    let mut snaps: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            n.starts_with("data.") && n.ends_with(".snap.parquet")
+        })
+        .collect();
+    snaps.sort();
+    snaps.into_iter().rev().find(|p| parquet_opens(p))
+}
+
+/// R5: if `path` exists but does not open as parquet, restore the newest
+/// readable snapshot over it; with no usable snapshot, move the corrupt file
+/// aside (kept for forensics) so the store starts fresh instead of failing
+/// on every launch. Missing and healthy files pass untouched.
+fn repair_corrupt_parquet(path: &Path) {
+    if !path.exists() || parquet_opens(path) {
+        return;
+    }
+    eprintln!(
+        "[TokenBuddy] {} 无法读取(损坏或截断),尝试从快照恢复",
+        path.display()
+    );
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    if let Some(snap) = newest_readable_snapshot(dir) {
+        let tmp = path.with_extension("parquet.recover");
+        if std::fs::copy(&snap, &tmp).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+            eprintln!(
+                "[TokenBuddy] 已从 {} 恢复 {} 行",
+                snap.display(),
+                parquet_row_count(path)
+            );
+            return;
+        }
+    }
+    let aside = path.with_file_name(format!("data.corrupt-{}.parquet", crate::now_ts()));
+    match std::fs::rename(path, &aside) {
+        Ok(()) => eprintln!(
+            "[TokenBuddy] 没有可读快照——损坏文件已移至 {};以空账本启动,来源日志仍在,可重新采集",
+            aside.display()
+        ),
+        Err(e) => eprintln!("[TokenBuddy] 损坏文件无法移开({e}),将以损坏状态继续尝试"),
+    }
+}
+
+fn parquet_row_count(path: &Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
+    std::fs::File::open(path)
+        .ok()
+        .and_then(|file| ParquetRecordBatchReaderBuilder::try_new(file).ok())
+        .map(|builder| builder.metadata().file_metadata().num_rows().max(0) as u64)
+        .unwrap_or(0)
+}
+
 fn sync_to_parquet(path: &Path, clear_existing: bool) -> Result<SyncResult> {
-    let claude_records = claude::collect_records()?;
-    let opencode_records = opencode::collect_records()?;
-    let mimo_records = mimo::collect_records()?;
-    let zcode_records = zcode::collect_records()?;
-    let pi_records = crate::pi::collect_records()?;
-    let qoder_records = qoder::collect_records()?;
-    let workbuddy_records = workbuddy::collect_records()?;
-    let minimax_records = minimax::collect_records()?;
+    let started = std::time::Instant::now();
+    let mut errors: Vec<SourceError> = Vec::new();
+
+    // Collected, absorbed and released one source at a time. Holding all eight
+    // result vectors — plus every collector's own parse cache — at once is what
+    // set a sync's high-water mark in the hundreds of MB on a real corpus; the
+    // peak is now bounded by the largest *single* source.
     let mut existing: HashSet<String> = if clear_existing {
         HashSet::new()
     } else {
@@ -422,20 +687,40 @@ fn sync_to_parquet(path: &Path, clear_existing: bool) -> Result<SyncResult> {
     // Key formulas are frozen per source: rows already in `data.parquet` were
     // written with them, so changing one would re-import history as duplicates.
     // A collector that ships its own stable id (`record_id`) always wins.
-    let (claude_imported, claude_skipped) =
-        absorb(&claude_records, &mut existing, &mut new_records, |r| {
+    let (claude_imported, claude_skipped) = {
+        let claude_records = collect_or_report(claude::collect_records, "claude", &mut errors);
+        let counted = absorb(&claude_records, &mut existing, &mut new_records, |r| {
             format!("cl_{}_{}", r.timestamp, r.input_tokens)
         });
-    let (opencode_imported, opencode_skipped) =
-        absorb(&opencode_records, &mut existing, &mut new_records, |r| {
+        // Free this source's parse cache before the next one allocates —
+        // left alone, the caches alone add up to the whole corpus.
+        claude::release_caches();
+        counted
+    };
+    let (opencode_imported, opencode_skipped) = {
+        let opencode_records =
+            collect_or_report(opencode::collect_records, "opencode", &mut errors);
+        let counted = absorb(&opencode_records, &mut existing, &mut new_records, |r| {
             format!("oc_{}_{}", r.timestamp, r.input_tokens)
         });
-    let (mimo_imported, mimo_skipped) =
-        absorb(&mimo_records, &mut existing, &mut new_records, |r| {
+        // Free this source's parse cache before the next one allocates —
+        // left alone, the caches alone add up to the whole corpus.
+        opencode::release_caches();
+        counted
+    };
+    let (mimo_imported, mimo_skipped) = {
+        let mimo_records = collect_or_report(mimo::collect_records, "mimo", &mut errors);
+        let counted = absorb(&mimo_records, &mut existing, &mut new_records, |r| {
             format!("mi_{}_{}", r.timestamp, r.input_tokens)
         });
-    let (zcode_imported, zcode_skipped) =
-        absorb(&zcode_records, &mut existing, &mut new_records, |r| {
+        // Free this source's parse cache before the next one allocates —
+        // left alone, the caches alone add up to the whole corpus.
+        mimo::release_caches();
+        counted
+    };
+    let (zcode_imported, zcode_skipped) = {
+        let zcode_records = collect_or_report(zcode::collect_records, "zcode", &mut errors);
+        let counted = absorb(&zcode_records, &mut existing, &mut new_records, |r| {
             format!(
                 "zc_{}_{}_{}",
                 r.session_id.as_deref().unwrap_or(""),
@@ -443,45 +728,130 @@ fn sync_to_parquet(path: &Path, clear_existing: bool) -> Result<SyncResult> {
                 r.input_tokens
             )
         });
-    let (pi_imported, pi_skipped) = absorb(&pi_records, &mut existing, &mut new_records, |r| {
-        format!(
-            "pi_{}_{}_{}",
-            r.session_id.as_deref().unwrap_or(""),
-            r.timestamp,
-            r.input_tokens
-        )
-    });
+        // Free this source's parse cache before the next one allocates —
+        // left alone, the caches alone add up to the whole corpus.
+        zcode::release_caches();
+        counted
+    };
+    let (pi_imported, pi_skipped) = {
+        let pi_records = collect_or_report(pi::collect_records, "pi", &mut errors);
+        let counted = absorb(&pi_records, &mut existing, &mut new_records, |r| {
+            format!(
+                "pi_{}_{}_{}",
+                r.session_id.as_deref().unwrap_or(""),
+                r.timestamp,
+                r.input_tokens
+            )
+        });
+        // Free this source's parse cache before the next one allocates —
+        // left alone, the caches alone add up to the whole corpus.
+        pi::release_caches();
+        counted
+    };
     // Qoder masks every token count, so the timestamp+tokens fallback key would
     // collapse whole sessions into one row; its request id is the key instead.
-    let (qoder_imported, qoder_skipped) =
-        absorb(&qoder_records, &mut existing, &mut new_records, |r| {
+    let (qoder_imported, qoder_skipped) = {
+        let qoder_records = collect_or_report(qoder::collect_records, "qoder", &mut errors);
+        let counted = absorb(&qoder_records, &mut existing, &mut new_records, |r| {
             format!(
                 "qo_{}_{}",
                 r.session_id.as_deref().unwrap_or(""),
                 r.timestamp
             )
         });
-    let (workbuddy_imported, workbuddy_skipped) =
-        absorb(&workbuddy_records, &mut existing, &mut new_records, |r| {
+        // Free this source's parse cache before the next one allocates —
+        // left alone, the caches alone add up to the whole corpus.
+        qoder::release_caches();
+        counted
+    };
+    let (workbuddy_imported, workbuddy_skipped) = {
+        let workbuddy_records =
+            collect_or_report(workbuddy::collect_records, "workbuddy", &mut errors);
+        let counted = absorb(&workbuddy_records, &mut existing, &mut new_records, |r| {
             format!(
                 "wb_{}_{}",
                 r.session_id.as_deref().unwrap_or(""),
                 r.timestamp
             )
         });
+        // Free this source's parse cache before the next one allocates —
+        // left alone, the caches alone add up to the whole corpus.
+        workbuddy::release_caches();
+        counted
+    };
     // MiniMax ships a provider responseId on every assistant line, so
     // `absorb` uses it via `record_id`; the session key below only covers
     // lines where the id is missing.
-    let (minimax_imported, minimax_skipped) =
-        absorb(&minimax_records, &mut existing, &mut new_records, |r| {
+    let (minimax_imported, minimax_skipped) = {
+        let minimax_records = collect_or_report(minimax::collect_records, "minimax", &mut errors);
+        let counted = absorb(&minimax_records, &mut existing, &mut new_records, |r| {
             format!(
                 "mx_{}_{}",
                 r.session_id.as_deref().unwrap_or(""),
                 r.timestamp
             )
         });
+        // Free this source's parse cache before the next one allocates —
+        // left alone, the caches alone add up to the whole corpus.
+        minimax::release_caches();
+        counted
+    };
+    // Hermes is the one replace-per-sync source: its rows are aggregates the
+    // gateway revises in place as a session grows, so a stored key would
+    // freeze the first-imported sums. Drop the previous `hermes_*` keys so
+    // every live row re-imports, and remember whether the file actually held
+    // any — the rewrite below must also run when the collector now yields
+    // nothing (the gateway pruned its history) so the bill can shrink with
+    // the source. `hermes_skipped` therefore stays 0: replacement, not
+    // skipping, is how an updated aggregate stays honest.
+    let he_stale = {
+        let before = existing.len();
+        existing.retain(|k| !k.starts_with("hermes_"));
+        before != existing.len()
+    };
+    let (hermes_imported, hermes_skipped) = {
+        let hermes_records = collect_or_report(hermes::collect_records, "hermes", &mut errors);
+        let counted = absorb(&hermes_records, &mut existing, &mut new_records, |r| {
+            format!(
+                "hm_{}_{}",
+                r.session_id.as_deref().unwrap_or(""),
+                r.timestamp
+            )
+        });
+        // Free this source's parse cache before the next one allocates —
+        // left alone, the caches alone add up to the whole corpus.
+        hermes::release_caches();
+        counted
+    };
+    // Codex events carry a stable per-response record id, so the fallback
+    // key below is never used; it exists to satisfy the absorb signature.
+    let (codex_imported, codex_skipped) = {
+        let codex_records = collect_or_report(crate::codex::collect_records, "codex", &mut errors);
+        let counted = absorb(&codex_records, &mut existing, &mut new_records, |r| {
+            format!("cx_{}_{}", r.timestamp, r.input_tokens)
+        });
+        crate::codex::release_caches();
+        counted
+    };
+    let (gemini_imported, gemini_skipped) = {
+        let gemini_records =
+            collect_or_report(crate::gemini::collect_records, "gemini", &mut errors);
+        let counted = absorb(&gemini_records, &mut existing, &mut new_records, |r| {
+            format!("ge_{}_{}", r.timestamp, r.input_tokens)
+        });
+        crate::gemini::release_caches();
+        counted
+    };
+    let (qwen_imported, qwen_skipped) = {
+        let qwen_records = collect_or_report(crate::qwen::collect_records, "qwen", &mut errors);
+        let counted = absorb(&qwen_records, &mut existing, &mut new_records, |r| {
+            format!("qw_{}_{}", r.timestamp, r.input_tokens)
+        });
+        crate::qwen::release_caches();
+        counted
+    };
 
-    if !new_records.is_empty() {
+    if !new_records.is_empty() || he_stale {
         let new_batch = records_to_batch(&new_records);
         let s = parquet_schema();
         // A full rebuild replaces the file, so it must not merge the stale rows
@@ -489,10 +859,18 @@ fn sync_to_parquet(path: &Path, clear_existing: bool) -> Result<SyncResult> {
         let merged = if path.exists() && !clear_existing {
             let file = std::fs::File::open(path)?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-            let batches: Vec<RecordBatch> = reader
+            let mut batches: Vec<RecordBatch> = reader
                 .into_iter()
                 .map(|b| align_batch(&b?, &s))
                 .collect::<Result<_>>()?;
+            // The old snapshot's hermes rows are superseded by this round's —
+            // filter them out so replacement does not turn into duplication.
+            if he_stale {
+                for batch in batches.iter_mut() {
+                    *batch = without_message_prefix(batch, "hermes_");
+                }
+                batches.retain(|b| b.num_rows() > 0);
+            }
             if batches.is_empty() {
                 new_batch
             } else {
@@ -505,6 +883,8 @@ fn sync_to_parquet(path: &Path, clear_existing: bool) -> Result<SyncResult> {
         };
         write_parquet(path, &merged)?;
     }
+
+    let total_after = parquet_row_count(path);
 
     Ok(SyncResult {
         claude_imported,
@@ -524,6 +904,24 @@ fn sync_to_parquet(path: &Path, clear_existing: bool) -> Result<SyncResult> {
         workbuddy_skipped,
         minimax_imported,
         minimax_skipped,
+        hermes_imported,
+        hermes_skipped,
+        codex_imported,
+        codex_skipped,
+        gemini_imported,
+        gemini_skipped,
+        qwen_imported,
+        qwen_skipped,
+        errors,
+        previous_total: None,
+        total_after,
+        duration_ms: started.elapsed().as_millis() as u64,
+        mode: if clear_existing {
+            "full"
+        } else {
+            "incremental"
+        }
+        .to_string(),
     })
 }
 
@@ -559,6 +957,75 @@ fn absorb<F: Fn(&TokenRecord) -> String>(
     (imported, skipped)
 }
 
+/// Copy `batch`, dropping every row whose `message_id` starts with `prefix`.
+///
+/// Hermes replacement is the only caller: the arrow meta-crate ships without
+/// compute features (binary-size budget), so there is no filter kernel to
+/// reach for — the fixed schema is walked with plain builders instead.
+fn without_message_prefix(batch: &RecordBatch, prefix: &str) -> RecordBatch {
+    let mid = batch
+        .column_by_name("message_id")
+        .expect("message_id column exists")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("message_id is utf8");
+    let keep: Vec<usize> = (0..batch.num_rows())
+        .filter(|&i| !mid.value(i).starts_with(prefix))
+        .collect();
+    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(batch.num_columns());
+    for field in batch.schema_ref().fields() {
+        let col = batch
+            .column_by_name(field.name())
+            .expect("field and column agree");
+        let filtered: Arc<dyn Array> = match field.data_type() {
+            DataType::Utf8 => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("utf8 column");
+                let mut b = StringBuilder::with_capacity(keep.len(), batch.num_rows() * 10);
+                for &i in &keep {
+                    b.append_value(arr.value(i));
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Int64 => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 column");
+                let mut b = Int64Builder::with_capacity(keep.len());
+                for &i in &keep {
+                    if arr.is_null(i) {
+                        b.append_null();
+                    } else {
+                        b.append_value(arr.value(i));
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Float64 => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("float64 column");
+                let mut b = Float64Builder::with_capacity(keep.len());
+                for &i in &keep {
+                    if arr.is_null(i) {
+                        b.append_null();
+                    } else {
+                        b.append_value(arr.value(i));
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            other => panic!("without_message_prefix: unexpected column type {other:?}"),
+        };
+        columns.push(filtered);
+    }
+    RecordBatch::try_new(batch.schema(), columns).expect("rebuild of an aligned batch shape")
+}
+
 /// Pad columns that an older `data.parquet` predates so its batches can be
 /// concatenated with rows written under the current schema.
 fn align_batch(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
@@ -592,8 +1059,192 @@ fn default_column(data_type: &DataType, n: usize) -> Arc<dyn Array> {
 
 // --- Store ---
 
+/// R8 — window facts: the subscription-quota view built from local facts
+/// only. No spend estimates, no outbound calls: how much went through in the
+/// currently-open 5h window and the trailing week, what the user's own 28-day
+/// window peak looks like (P90 + max), and where the open window stands
+/// against that reference at the current burn rate.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WindowFact {
+    /// Epoch seconds the open window started (first request after the
+    /// previous one expired).
+    pub window_start: i64,
+    pub window_tokens: u64,
+    pub window_requests: u64,
+    /// tokens/hour across the open window so far.
+    pub burn_per_hour: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WindowsFacts {
+    /// Newest row in the store — "now" as far as the data can see.
+    pub data_now: i64,
+    /// The 5h window currently open, if any request falls inside it.
+    pub open_window: Option<WindowFact>,
+    /// Last 168h of tokens, mirroring a weekly limit's rolling shape.
+    pub week_tokens: u64,
+    pub week_requests: u64,
+    /// 28 days of 5h windows: the 90th-percentile and the max sum. These are
+    /// the user's own historical rhythm — a reference scale, not a quota.
+    pub p90_5h_tokens: u64,
+    pub max_5h_tokens: u64,
+    /// open window tokens as a fraction of P90 (None when P90 is 0).
+    pub p90_ratio: Option<f64>,
+    /// Hours until the open window reaches P90 at the current burn rate.
+    /// Negative = already past it. None = no burn yet.
+    pub hours_to_p90: Option<f64>,
+}
+
+/// The subscription window this tool mirrors: five hours, first request opens
+/// the next one.
+pub const WINDOW_SECS: i64 = 5 * 3600;
+/// How far back window history reaches for the P90 reference.
+pub const WINDOW_HISTORY_DAYS: i64 = 28;
+
+/// Segment rows (ascending (ts, tokens)) into 5h windows: a window opens at
+/// its first request and expires WINDOW_SECS later; the next request after
+/// expiry opens the following one. Returns (start_ts, tokens, requests) per
+/// window, ascending.
+/// Typed accessor for a named Int64 column of a batch.
+fn int_col_named<'a>(b: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
+    let idx = b.schema().index_of(name)?;
+    b.column(idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow::anyhow!("{name} is not Int64"))
+}
+
+pub fn segment_windows(rows: &[(i64, u64)]) -> Vec<(i64, u64, u64)> {
+    let mut out: Vec<(i64, u64, u64)> = Vec::new();
+    for &(ts, tokens) in rows {
+        match out.last_mut() {
+            Some((start, sum, count)) if ts - *start < WINDOW_SECS => {
+                *sum += tokens;
+                *count += 1;
+            }
+            _ => out.push((ts, tokens, 1)),
+        }
+    }
+    out
+}
+
+/// P90 over window sums, linear interpolation between adjacent order
+/// statistics (the usual default so small samples still move the number).
+fn percentile90(sums: &mut [u64]) -> u64 {
+    if sums.is_empty() {
+        return 0;
+    }
+    sums.sort_unstable();
+    let n = sums.len();
+    let rank = 0.9 * (n - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    let v = sums[lo] as f64 + (sums[hi] as f64 - sums[lo] as f64) * (rank - lo as f64);
+    v as u64
+}
+
+/// R11 — daily usage anomalies via weekday-stratified robust z-scores.
+/// Daily token volume has strong weekday periodicity, so each day is
+/// compared only against same-weekday history (trailing 8 weeks). The
+/// modified z-score `0.6745·(x−median)/MAD` (Iglewicz & Hoaglin) is robust
+/// to the outliers it hunts: a spike never inflates its own baseline.
+/// |z| > 3.5 is the standard flag threshold.
+pub const ANOMALY_Z: f64 = 3.5;
+/// Same-weekday samples required before a day can be judged.
+pub const ANOMALY_MIN_BASELINE: usize = 3;
+/// How far back the audit reaches.
+pub const ANOMALY_HISTORY_DAYS: usize = 56;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AnomalyDay {
+    pub date: String,
+    pub tokens: u64,
+    pub baseline_median: u64,
+    pub modified_z: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct AnomalyReport {
+    pub checked_days: usize,
+    pub flagged: Vec<AnomalyDay>,
+}
+
+pub fn detect_daily_anomalies(days: &[(String, u64)]) -> AnomalyReport {
+    use chrono::Datelike;
+    let mut report = AnomalyReport {
+        checked_days: days.len(),
+        flagged: Vec::new(),
+    };
+    if days.len() <= ANOMALY_MIN_BASELINE {
+        return report;
+    }
+    let weekday = |label: &str| {
+        chrono::NaiveDate::parse_from_str(label, "%Y-%m-%d")
+            .map(|d| d.weekday().num_days_from_monday())
+            .ok()
+    };
+
+    for (i, (label, tokens)) in days.iter().enumerate() {
+        let Some(wd) = weekday(label) else { continue };
+        // Same-weekday samples strictly before this day, within the window.
+        let history: Vec<u64> = days[..i]
+            .iter()
+            .filter(|(l, _)| weekday(l) == Some(wd))
+            .map(|(_, t)| *t)
+            .collect();
+        if history.len() < ANOMALY_MIN_BASELINE {
+            continue;
+        }
+        let mut sorted = history.clone();
+        sorted.sort_unstable();
+        let median = sorted[sorted.len() / 2] as f64;
+        let mut devs: Vec<f64> = history.iter().map(|t| (*t as f64 - median).abs()).collect();
+        devs.sort_by(|a, b| a.total_cmp(b));
+        let mad = devs[devs.len() / 2];
+        // Zero MAD with a nonzero deviation is itself the strongest signal.
+        let z = if mad == 0.0 {
+            if *tokens as f64 != median {
+                f64::INFINITY
+            } else {
+                0.0
+            }
+        } else {
+            0.6745 * (*tokens as f64 - median).abs() / mad
+        };
+        if z > ANOMALY_Z {
+            report.flagged.push(AnomalyDay {
+                date: label.clone(),
+                tokens: *tokens,
+                baseline_median: median as u64,
+                modified_z: if z.is_infinite() { f64::MAX } else { z },
+            });
+        }
+    }
+    report
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PivotRow {
+    pub project: String,
+    pub model: String,
+    pub tokens: u64,
+    pub requests: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct Pivot {
+    pub rows: Vec<PivotRow>,
+}
+
 pub struct Store {
     parquet_path: PathBuf,
+}
+
+/// One source's footprint in the ledger (doctor's "did anything land" view).
+pub struct SourceLedgerStat {
+    pub source: String,
+    pub rows: u64,
+    pub latest_ts: i64,
 }
 
 impl Store {
@@ -624,22 +1275,129 @@ impl Store {
         // One-time cleanup: the DuckDB engine file outlived the engine —
         // every query now aggregates straight from the parquet.
         let _ = std::fs::remove_file(base.join("tokenbuddy.duckdb"));
+        // R5: a corrupt store must never become a crash loop. A file that
+        // cannot even be opened is repaired from the newest readable
+        // snapshot, or moved aside for a fresh start — either way the server
+        // comes up and reports what happened.
+        repair_corrupt_parquet(&parquet_path);
         migrate_parquet_schema(&parquet_path)?;
 
         Ok(Self { parquet_path })
     }
 
     pub fn record_count(&self) -> Result<u64> {
-        if !self.parquet_path.exists() {
-            return Ok(0);
+        Ok(parquet_row_count(&self.parquet_path))
+    }
+
+    /// Per-source ledger presence for doctor: how many rows actually landed
+    /// and how fresh the newest is. "The collector can read the logs" and
+    /// "rows reached the ledger" are different facts — dedup and format
+    /// misses are silent zeroes on the path between them.
+    pub fn query_source_ledger_stats(&self) -> Result<Vec<SourceLedgerStat>> {
+        let batches = if !self.parquet_path.exists() {
+            vec![]
+        } else {
+            rust_read_agg_columns(&self.parquet_path)?
+        };
+        let mut acc: HashMap<String, (u64, i64)> = HashMap::new();
+        for batch in &batches {
+            for i in 0..batch.num_rows() {
+                let src = col_str(batch, "source", i);
+                let ts = col_i64(batch, "timestamp", i);
+                let e = acc.entry(src.to_string()).or_insert((0, 0));
+                e.0 += 1;
+                if ts > e.1 {
+                    e.1 = ts;
+                }
+            }
         }
-        let file = std::fs::File::open(&self.parquet_path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        Ok(builder.metadata().file_metadata().num_rows().max(0) as u64)
+        let mut out: Vec<SourceLedgerStat> = acc
+            .into_iter()
+            .map(|(source, (rows, latest_ts))| SourceLedgerStat {
+                source,
+                rows,
+                latest_ts,
+            })
+            .collect();
+        out.sort_by(|a, b| b.rows.cmp(&a.rows).then(a.source.cmp(&b.source)));
+        Ok(out)
+    }
+
+    /// Directory holding `data.parquet`, `state.json` and the snapshots.
+    fn base_dir(&self) -> PathBuf {
+        self.parquet_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Last completed sync, as recorded on disk. A missing or unreadable file
+    /// reads as "never synced" rather than an error — the dashboard has to
+    /// render on a first run, before anything has ever been written.
+    pub fn state(&self) -> SyncState {
+        std::fs::read_to_string(self.base_dir().join("state.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist sync facts. Best effort by design: failing to write a
+    /// bookkeeping file must not fail a sync whose data is already safe.
+    fn write_state(&self, mode: &str, result: &SyncResult) {
+        let state = SyncState {
+            last_sync_at: Some(crate::now_ts()),
+            last_sync_mode: Some(mode.to_string()),
+            last_sync_imported: Some(imported_total(result)),
+            last_sync_duration_ms: Some(result.duration_ms),
+            last_sync_errors: result.errors.clone(),
+        };
+        match serde_json::to_vec_pretty(&state) {
+            Ok(raw) => {
+                if let Err(e) = std::fs::write(self.base_dir().join("state.json"), raw) {
+                    eprintln!("[TokenBuddy] cannot write state.json: {e}");
+                }
+            }
+            Err(e) => eprintln!("[TokenBuddy] cannot serialize state.json: {e}"),
+        }
+    }
+
+    /// Per-collector presence, for the source-health panel and the first-run
+    /// prompt. Pure filesystem checks — cheap enough to call on every load.
+    pub fn source_status(&self) -> Vec<SourceHealth> {
+        let probes: [(&str, &str, Option<PathBuf>); 12] = [
+            ("claude", "Claude Code", claude::log_path()),
+            ("codex", "Codex CLI", crate::codex::log_path()),
+            ("gemini", "Gemini CLI", crate::gemini::log_path()),
+            ("qwen", "Qwen Code", crate::qwen::log_path()),
+            ("zcode", "ZCode", zcode::log_path()),
+            ("qoder", "Qoder", qoder::log_path()),
+            ("workbuddy", "WorkBuddy", workbuddy::log_path()),
+            ("minimax", "MiniMax Code", minimax::log_path()),
+            ("hermes", "Hermes Agent", hermes::log_path()),
+            ("opencode", "OpenCode", opencode::log_path()),
+            ("mimo", "Mimo", mimo::log_path()),
+            ("pi", "Pi", pi::log_path()),
+        ];
+        probes
+            .into_iter()
+            .map(|(id, label, path)| SourceHealth {
+                id: id.to_string(),
+                label: label.to_string(),
+                present: path.is_some(),
+                path: path.map(|p| p.to_string_lossy().into_owned()),
+            })
+            .collect()
     }
 
     pub fn sync(&self) -> Result<SyncResult> {
-        sync_to_parquet(&self.parquet_path, false)
+        let result = sync_to_parquet(&self.parquet_path, false)?;
+        self.write_state("incremental", &result);
+        Ok(result)
+    }
+
+    /// Where this store's aggregate parquet lives (fleet push reads it).
+    pub fn parquet_path(&self) -> &Path {
+        &self.parquet_path
     }
 
     /// Rebuild from the collectors only. Rows whose source log has since been
@@ -653,12 +1411,27 @@ impl Store {
     pub fn sync_full(&self) -> Result<SyncResult> {
         eprintln!("[TokenBuddy] sync_full: rebuilding from scratch...");
         let snapshot = self.snapshot_parquet()?;
+        // Counted off the snapshot, which is the store exactly as it was a
+        // moment ago — the only way the UI can tell the user that a rebuild
+        // shrank their history instead of implying it grew.
+        let previous_total = snapshot.as_ref().map(|p| parquet_row_count(p));
         match sync_to_parquet(&self.parquet_path, true) {
-            Ok(result) => {
+            Ok(mut result) => {
+                result.previous_total = previous_total;
+                let lost = previous_total
+                    .map(|before| before.saturating_sub(result.total_after))
+                    .unwrap_or(0);
+                if lost > 0 {
+                    eprintln!(
+                        "[TokenBuddy] sync_full: {lost} row(s) could not be re-derived from \
+                         surviving logs (snapshot kept for recovery)"
+                    );
+                }
                 let kept = self.prune_snapshots(SNAPSHOT_KEEP)?;
                 if kept > 0 {
                     eprintln!("[TokenBuddy] sync_full: pruned {kept} old snapshot(s)");
                 }
+                self.write_state("full", &result);
                 Ok(result)
             }
             Err(e) => {
@@ -875,6 +1648,208 @@ impl Store {
     /// and cache efficiency for every model in the filter window.
     /// Aggregates in memory for the same reason as
     /// `query_metrics`: the per-row percentiles are cheaper than SQL.
+    /// R8: subscription-window facts from local rows only. Reads
+    /// (timestamp, four token columns) for the last 28 days and segments
+    /// them into 5h windows. See [`WindowsFacts`].
+    pub fn query_windows(&self) -> Result<WindowsFacts> {
+        const HISTORY: i64 = WINDOW_HISTORY_DAYS * 86_400;
+        let empty = || WindowsFacts {
+            data_now: 0,
+            open_window: None,
+            week_tokens: 0,
+            week_requests: 0,
+            p90_5h_tokens: 0,
+            max_5h_tokens: 0,
+            p90_ratio: None,
+            hours_to_p90: None,
+        };
+        if !self.parquet_path.exists() {
+            return Ok(empty());
+        }
+        let batches = rust_read_agg_columns(&self.parquet_path)?;
+        let mut rows: Vec<(i64, u64)> = Vec::new();
+        for b in &batches {
+            let ts = b
+                .column(b.schema().index_of("timestamp")?)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("timestamp is i64");
+            let inp = int_col_named(b, "input_tokens")?;
+            let out = int_col_named(b, "output_tokens")?;
+            let cr = int_col_named(b, "cache_read_tokens")?;
+            let cw = int_col_named(b, "cache_creation_tokens")?;
+            for i in 0..b.num_rows() {
+                let t = inp.value(i).max(0) as u64
+                    + out.value(i).max(0) as u64
+                    + cr.value(i).max(0) as u64
+                    + cw.value(i).max(0) as u64;
+                rows.push((ts.value(i), t));
+            }
+        }
+        if rows.is_empty() {
+            return Ok(empty());
+        }
+        rows.sort_by_key(|(ts, _)| *ts);
+        let data_now = rows.last().map(|(ts, _)| *ts).unwrap_or(0);
+        let horizon = data_now - HISTORY;
+
+        let windows = segment_windows(&rows);
+        let recent: Vec<(i64, u64, u64)> = windows
+            .iter()
+            .copied()
+            .filter(|(start, _, _)| *start >= horizon)
+            .collect();
+
+        // Trailing week = requests in [data_now - 168h, data_now].
+        let week_start = data_now - 168 * 3600;
+        let week: (u64, u64) = rows
+            .iter()
+            .filter(|(ts, _)| *ts >= week_start)
+            .fold((0, 0), |(t, c), (_, tok)| (t + tok, c + 1));
+
+        let open = recent.last().copied();
+        let open_window = open.map(|(start, tokens, requests)| {
+            let hours = ((data_now - start).max(1)) as f64 / 3600.0;
+            WindowFact {
+                window_start: start,
+                window_tokens: tokens,
+                window_requests: requests,
+                burn_per_hour: tokens as f64 / hours,
+            }
+        });
+
+        let mut sums: Vec<u64> = recent.iter().map(|(_, t, _)| *t).collect();
+        let p90 = percentile90(&mut sums);
+        let max = sums.last().copied().unwrap_or(0);
+        let (p90_ratio, hours_to_p90) = match (&open_window, p90) {
+            (Some(w), p) if p > 0 => {
+                let ratio = Some(w.window_tokens as f64 / p as f64);
+                let hours = if w.burn_per_hour > 0.0 {
+                    Some((p as f64 - w.window_tokens as f64) / w.burn_per_hour)
+                } else {
+                    None
+                };
+                (ratio, hours)
+            }
+            (Some(_), 0) => (None, None),
+            _ => (None, None),
+        };
+
+        Ok(WindowsFacts {
+            data_now,
+            open_window,
+            week_tokens: week.0,
+            week_requests: week.1,
+            p90_5h_tokens: p90,
+            max_5h_tokens: max,
+            p90_ratio,
+            hours_to_p90,
+        })
+    }
+
+    /// R11: audit the last 56 days for daily usage anomalies. Days are
+    /// bucketed on China-local midnight (the same labels the dashboard uses).
+    pub fn query_anomalies(&self) -> Result<AnomalyReport> {
+        if !self.parquet_path.exists() {
+            return Ok(AnomalyReport::default());
+        }
+        let batches = rust_read_agg_columns(&self.parquet_path)?;
+        let horizon = crate::cn_midnight(ANOMALY_HISTORY_DAYS as i64);
+        let mut by_day: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for b in &batches {
+            let ts = b
+                .column(b.schema().index_of("timestamp")?)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("timestamp is i64");
+            let inp = int_col_named(b, "input_tokens")?;
+            let out = int_col_named(b, "output_tokens")?;
+            let cr = int_col_named(b, "cache_read_tokens")?;
+            let cw = int_col_named(b, "cache_creation_tokens")?;
+            for i in 0..b.num_rows() {
+                let t = ts.value(i);
+                if t < horizon {
+                    continue;
+                }
+                *by_day.entry(crate::cn_day_label(t)).or_insert(0) += (inp.value(i).max(0)
+                    + out.value(i).max(0)
+                    + cr.value(i).max(0)
+                    + cw.value(i).max(0))
+                    as u64;
+            }
+        }
+        let days: Vec<(String, u64)> = by_day.into_iter().collect();
+        Ok(detect_daily_anomalies(&days))
+    }
+
+    /// R14: project × model attribution grid. Only rows whose source log
+    /// named a project appear; the caller decides how to present the blank
+    /// slice. Sorted by tokens descending.
+    pub fn query_pivot(&self, date_start: Option<i64>, date_end: Option<i64>) -> Result<Pivot> {
+        let mut grid: std::collections::HashMap<(String, String), (u64, u64)> =
+            std::collections::HashMap::new();
+        if self.parquet_path.exists() {
+            let batches = rust_read_agg_columns(&self.parquet_path)?;
+            for b in &batches {
+                let ts = b
+                    .column(b.schema().index_of("timestamp")?)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("timestamp is i64");
+                let proj = b
+                    .column(b.schema().index_of("project")?)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("project is utf8");
+                let model = b
+                    .column(b.schema().index_of("model")?)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("model is utf8");
+                let inp = int_col_named(b, "input_tokens")?;
+                let out = int_col_named(b, "output_tokens")?;
+                let cr = int_col_named(b, "cache_read_tokens")?;
+                let cw = int_col_named(b, "cache_creation_tokens")?;
+                for i in 0..b.num_rows() {
+                    if let Some(s) = date_start {
+                        if ts.value(i) < s {
+                            continue;
+                        }
+                    }
+                    if let Some(e) = date_end {
+                        if ts.value(i) >= e {
+                            continue;
+                        }
+                    }
+                    let project = if proj.is_null(i) { "" } else { proj.value(i) };
+                    if project.is_empty() {
+                        continue;
+                    }
+                    let tokens = (inp.value(i).max(0)
+                        + out.value(i).max(0)
+                        + cr.value(i).max(0)
+                        + cw.value(i).max(0)) as u64;
+                    let e = grid
+                        .entry((project.to_string(), model.value(i).to_string()))
+                        .or_insert((0, 0));
+                    e.0 += tokens;
+                    e.1 += 1;
+                }
+            }
+        }
+        let mut rows: Vec<PivotRow> = grid
+            .into_iter()
+            .map(|((project, model), (tokens, requests))| PivotRow {
+                project,
+                model,
+                tokens,
+                requests,
+            })
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.tokens));
+        Ok(Pivot { rows })
+    }
+
     pub fn query_models(
         &self,
         source: Option<&str>,
@@ -883,152 +1858,59 @@ impl Store {
         date_end: Option<i64>,
     ) -> Result<ModelComparison> {
         let batches = rust_read_agg_columns(&self.parquet_path)?;
+        rust_compute_models(&batches, source, model, date_start, date_end)
+    }
 
-        struct ModelAcc {
-            sources: std::collections::BTreeSet<String>,
-            requests: u64,
-            inp: u64,
-            out: u64,
-            cr: u64,
-            cw: u64,
-            credits: f64,
-            durs: Vec<u64>,
-            ttfts: Vec<u64>,
-            /// Sum of (output_tokens, duration_ms) pairs for aggregate
-            /// throughput; both values only count rows that have a duration.
-            out_with_dur: u64,
-            dur_ms_with_out: u64,
-        }
+    /// Hosts with locally pulled fleet data, sorted for a stable UI order.
+    pub fn fleet_hosts(&self) -> Vec<String> {
+        fleet_paths().into_iter().map(|(h, _)| h).collect()
+    }
 
-        let mut map: HashMap<String, ModelAcc> = HashMap::new();
-        for batch in &batches {
-            let n = batch.num_rows();
-            for i in 0..n {
-                let src = col_str(batch, "source", i);
-                let mdl = col_str(batch, "model", i);
-                let ts = col_i64(batch, "timestamp", i);
-                let inp = col_i64(batch, "input_tokens", i) as u64;
-                let out = col_i64(batch, "output_tokens", i) as u64;
-                let cr = col_i64(batch, "cache_read_tokens", i) as u64;
-                let cw = col_i64(batch, "cache_creation_tokens", i) as u64;
-                let credits = col_f64(batch, "credits", i);
+    /// Fleet-wide totals plus per-host rows and the host × source matrix.
+    /// The pulled parquets are read with the usual aggregation columns plus
+    /// an in-memory `host` column, so the single-machine aggregators do all
+    /// the arithmetic; a host filter just narrows which files are read.
+    pub fn query_fleet_summary(
+        &self,
+        host: Option<&str>,
+        source: Option<&str>,
+        model: Option<&str>,
+        date_start: Option<i64>,
+        date_end: Option<i64>,
+    ) -> Result<FleetSummary> {
+        query_fleet_summary_in(&fleet_base(), host, source, model, date_start, date_end)
+    }
 
-                if let Some(s) = source {
-                    if src != s {
-                        continue;
-                    }
-                }
-                if let Some(m) = model {
-                    if !mdl.contains(m) {
-                        continue;
-                    }
-                }
-                if let Some(d) = date_start {
-                    if ts < d {
-                        continue;
-                    }
-                }
-                if let Some(d) = date_end {
-                    if ts >= d {
-                        continue;
-                    }
-                }
+    /// Fleet-wide metrics keyed by host. Per host, the same aggregation as
+    /// the local endpoint runs over that host's batches; the totals run
+    /// over all of them combined.
+    pub fn query_fleet_metrics(
+        &self,
+        host: Option<&str>,
+        source: Option<&str>,
+        model: Option<&str>,
+        date_start: Option<i64>,
+        date_end: Option<i64>,
+    ) -> Result<FleetMetrics> {
+        query_fleet_metrics_in(&fleet_base(), host, source, model, date_start, date_end)
+    }
 
-                let acc = map.entry(mdl.to_string()).or_insert_with(|| ModelAcc {
-                    sources: Default::default(),
-                    requests: 0,
-                    inp: 0,
-                    out: 0,
-                    cr: 0,
-                    cw: 0,
-                    credits: 0.0,
-                    durs: Vec::new(),
-                    ttfts: Vec::new(),
-                    out_with_dur: 0,
-                    dur_ms_with_out: 0,
-                });
-                acc.requests += 1;
-                acc.sources.insert(src.to_string());
-                acc.inp += inp;
-                acc.out += out;
-                acc.cr += cr;
-                acc.cw += cw;
-                acc.credits += credits;
-                if let Some(d) = col_i64_opt(batch, "duration_ms", i) {
-                    if d >= 0 {
-                        acc.durs.push(d as u64);
-                        acc.out_with_dur += out;
-                        acc.dur_ms_with_out += d as u64;
-                    }
-                }
-                if let Some(t) = col_i64_opt(batch, "ttft_ms", i) {
-                    if t >= 0 {
-                        acc.ttfts.push(t as u64);
-                    }
-                }
-            }
-        }
-
-        fn percentile(sorted: &[u64], p: f64) -> Option<f64> {
-            if sorted.is_empty() {
-                return None;
-            }
-            let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
-            Some(sorted[idx.min(sorted.len() - 1)] as f64)
-        }
-
-        let mut models: Vec<ModelStat> = map
-            .into_iter()
-            .map(|(mdl, a)| {
-                let total_tokens = a.inp + a.out + a.cr + a.cw;
-                let mut durs = a.durs;
-                durs.sort_unstable();
-                let mut ttfts = a.ttfts;
-                ttfts.sort_unstable();
-                let avg = |v: &[u64]| {
-                    if v.is_empty() {
-                        None
-                    } else {
-                        Some(v.iter().sum::<u64>() as f64 / v.len() as f64)
-                    }
-                };
-                ModelStat {
-                    family: crate::model_family(&mdl),
-                    sources: a.sources.into_iter().collect(),
-                    requests: a.requests,
-                    input_tokens: a.inp,
-                    output_tokens: a.out,
-                    cache_read_tokens: a.cr,
-                    cache_creation_tokens: a.cw,
-                    total_tokens,
-                    credits: a.credits,
-                    avg_tokens_per_req: if a.requests > 0 {
-                        total_tokens as f64 / a.requests as f64
-                    } else {
-                        0.0
-                    },
-                    avg_duration_ms: avg(&durs),
-                    p95_duration_ms: percentile(&durs, 0.95),
-                    avg_ttft_ms: avg(&ttfts),
-                    p95_ttft_ms: percentile(&ttfts, 0.95),
-                    tokens_per_sec: if a.dur_ms_with_out > 0 {
-                        Some(a.out_with_dur as f64 / (a.dur_ms_with_out as f64 / 1000.0))
-                    } else {
-                        None
-                    },
-                    cache_hit_rate: if a.cr + a.inp > 0 {
-                        Some(a.cr as f64 / (a.cr + a.inp) as f64)
-                    } else {
-                        None
-                    },
-                    model: mdl,
-                }
-            })
+    /// Fleet-wide per-model comparison; identical semantics to the local
+    /// one, with the hosts that used each model attached.
+    pub fn query_fleet_models(
+        &self,
+        host: Option<&str>,
+        source: Option<&str>,
+        model: Option<&str>,
+        date_start: Option<i64>,
+        date_end: Option<i64>,
+    ) -> Result<ModelComparison> {
+        let base = fleet_base();
+        let combined: Vec<RecordBatch> = read_fleet_batches(&base, host)?
+            .iter()
+            .flat_map(|(_, batches)| batches.iter().cloned())
             .collect();
-
-        models.sort_by_key(|m| std::cmp::Reverse(m.total_tokens));
-
-        Ok(ModelComparison { models })
+        rust_compute_models(&combined, source, model, date_start, date_end)
     }
 }
 
@@ -1041,6 +1923,7 @@ fn empty_summary() -> Summary {
         total_cache_creation_tokens: 0,
         total_tokens: 0,
         total_credits: 0.0,
+        avg_context_ratio: None,
         by_source: vec![],
         by_model: vec![],
     }
@@ -1528,6 +2411,7 @@ fn rust_compute_summary(
         total_cache_creation_tokens: total.cache_creation_tokens,
         total_tokens: total.total_tokens(),
         total_credits: total.credits,
+        avg_context_ratio: total.avg_context_ratio(),
         by_source: by_source
             .into_iter()
             .map(|(source, a)| SourceRow {
@@ -1549,7 +2433,7 @@ fn rust_compute_summary(
 
 /// The per-source split the timeline carries, in `TimelineBucket` field
 /// order; the index into `Acc.src` comes from `TIMELINE_SOURCES`.
-const TIMELINE_SOURCES: [&str; 8] = [
+const TIMELINE_SOURCES: [&str; 9] = [
     "claude",
     "opencode",
     "mimo",
@@ -1558,6 +2442,7 @@ const TIMELINE_SOURCES: [&str; 8] = [
     "qoder",
     "workbuddy",
     "minimax",
+    "hermes",
 ];
 
 #[derive(Default)]
@@ -1567,7 +2452,7 @@ struct TimelineAcc {
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_creation_tokens: u64,
-    src: [u64; 8],
+    src: [u64; 9],
 }
 
 /// Bucket label for one granularity, matching the SQL expressions the
@@ -1651,6 +2536,7 @@ fn rust_compute_timeline(
             qoder_tokens: a.src[5],
             workbuddy_tokens: a.src[6],
             minimax_tokens: a.src[7],
+            hermes_tokens: a.src[8],
         })
         .collect())
 }
@@ -2024,7 +2910,8 @@ fn rust_compute_heatmap(
             "qoder" => 5,
             "workbuddy" => 6,
             "minimax" => 7,
-            _ => 8,
+            "hermes" => 8,
+            _ => 9,
         };
         col_labels.sort_by_key(|c| (order(c), c.clone()));
     }
@@ -2073,10 +2960,528 @@ fn rust_compute_heatmap(
     })
 }
 
+// --- Per-model comparison (shared by local and fleet queries) ---
+
+fn rust_compute_models(
+    batches: &[RecordBatch],
+    source_filter: Option<&str>,
+    model_filter: Option<&str>,
+    ds: Option<i64>,
+    de: Option<i64>,
+) -> Result<ModelComparison> {
+    struct ModelAcc {
+        sources: std::collections::BTreeSet<String>,
+        /// Only populated when batches carry the injected fleet `host`
+        /// column; local queries leave it empty.
+        hosts: std::collections::BTreeSet<String>,
+        requests: u64,
+        inp: u64,
+        out: u64,
+        cr: u64,
+        cw: u64,
+        credits: f64,
+        durs: Vec<u64>,
+        ttfts: Vec<u64>,
+        /// Sum of (output_tokens, duration_ms) pairs for aggregate
+        /// throughput; both values only count rows that have a duration.
+        out_with_dur: u64,
+        dur_ms_with_out: u64,
+    }
+
+    let mut map: HashMap<String, ModelAcc> = HashMap::new();
+    for batch in batches {
+        let n = batch.num_rows();
+        for i in 0..n {
+            let src = col_str(batch, "source", i);
+            let mdl = col_str(batch, "model", i);
+            let ts = col_i64(batch, "timestamp", i);
+            let inp = col_i64(batch, "input_tokens", i) as u64;
+            let out = col_i64(batch, "output_tokens", i) as u64;
+            let cr = col_i64(batch, "cache_read_tokens", i) as u64;
+            let cw = col_i64(batch, "cache_creation_tokens", i) as u64;
+            let credits = col_f64(batch, "credits", i);
+
+            if !row_passes(src, mdl, ts, source_filter, model_filter, ds, de) {
+                continue;
+            }
+
+            let acc = map.entry(mdl.to_string()).or_insert_with(|| ModelAcc {
+                sources: Default::default(),
+                hosts: Default::default(),
+                requests: 0,
+                inp: 0,
+                out: 0,
+                cr: 0,
+                cw: 0,
+                credits: 0.0,
+                durs: Vec::new(),
+                ttfts: Vec::new(),
+                out_with_dur: 0,
+                dur_ms_with_out: 0,
+            });
+            acc.requests += 1;
+            acc.sources.insert(src.to_string());
+            let host = col_str(batch, "host", i);
+            if !host.is_empty() {
+                acc.hosts.insert(host.to_string());
+            }
+            acc.inp += inp;
+            acc.out += out;
+            acc.cr += cr;
+            acc.cw += cw;
+            acc.credits += credits;
+            if let Some(d) = col_i64_opt(batch, "duration_ms", i) {
+                if d >= 0 {
+                    acc.durs.push(d as u64);
+                    acc.out_with_dur += out;
+                    acc.dur_ms_with_out += d as u64;
+                }
+            }
+            if let Some(t) = col_i64_opt(batch, "ttft_ms", i) {
+                if t >= 0 {
+                    acc.ttfts.push(t as u64);
+                }
+            }
+        }
+    }
+
+    fn percentile(sorted: &[u64], p: f64) -> Option<f64> {
+        if sorted.is_empty() {
+            return None;
+        }
+        let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+        Some(sorted[idx.min(sorted.len() - 1)] as f64)
+    }
+
+    let mut models: Vec<ModelStat> = map
+        .into_iter()
+        .map(|(mdl, a)| {
+            let total_tokens = a.inp + a.out + a.cr + a.cw;
+            let mut durs = a.durs;
+            durs.sort_unstable();
+            let mut ttfts = a.ttfts;
+            ttfts.sort_unstable();
+            let avg = |v: &[u64]| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.iter().sum::<u64>() as f64 / v.len() as f64)
+                }
+            };
+            ModelStat {
+                family: crate::model_family(&mdl),
+                sources: a.sources.into_iter().collect(),
+                hosts: a.hosts.into_iter().collect(),
+                requests: a.requests,
+                input_tokens: a.inp,
+                output_tokens: a.out,
+                cache_read_tokens: a.cr,
+                cache_creation_tokens: a.cw,
+                total_tokens,
+                credits: a.credits,
+                avg_tokens_per_req: if a.requests > 0 {
+                    total_tokens as f64 / a.requests as f64
+                } else {
+                    0.0
+                },
+                avg_duration_ms: avg(&durs),
+                p95_duration_ms: percentile(&durs, 0.95),
+                avg_ttft_ms: avg(&ttfts),
+                p95_ttft_ms: percentile(&ttfts, 0.95),
+                tokens_per_sec: if a.dur_ms_with_out > 0 {
+                    Some(a.out_with_dur as f64 / (a.dur_ms_with_out as f64 / 1000.0))
+                } else {
+                    None
+                },
+                cache_hit_rate: if a.cr + a.inp > 0 {
+                    Some(a.cr as f64 / (a.cr + a.inp) as f64)
+                } else {
+                    None
+                },
+                model: mdl,
+            }
+        })
+        .collect();
+
+    models.sort_by_key(|m| std::cmp::Reverse(m.total_tokens));
+
+    Ok(ModelComparison { models })
+}
+
+// --- Fleet reads (pulled host parquets under ~/.tokenbuddy/fleet/) ---
+
+fn fleet_base() -> PathBuf {
+    crate::data_dir().join("fleet")
+}
+
+/// (host, parquet path) for every host pulled by fleet-sync, sorted by host.
+/// A host directory only counts once its data.parquet has fully landed.
+pub fn fleet_paths_in(base: &Path) -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = std::fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path().join("data.parquet");
+            let host = e.file_name().to_str()?.to_string();
+            path.exists().then_some((host, path))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+pub fn fleet_paths() -> Vec<(String, PathBuf)> {
+    fleet_paths_in(&fleet_base())
+}
+
+/// Stamp every row of a pulled host parquet with an in-memory `host` column,
+/// so the shared aggregators can group and filter by machine without the
+/// column ever existing on disk.
+fn with_host_column(batch: &RecordBatch, host: &str) -> Result<RecordBatch> {
+    let n = batch.num_rows();
+    let mut fields: Vec<Arc<Field>> = batch.schema().fields().iter().cloned().collect();
+    fields.push(Arc::new(Field::new("host", DataType::Utf8, false)));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(StringArray::from(vec![host; n])));
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
+}
+
+/// Read the pulled hosts (or just `host_filter`'s) with the aggregation
+/// columns plus the injected host column: one (host, batches) pair per host.
+fn read_fleet_batches(
+    base: &Path,
+    host_filter: Option<&str>,
+) -> Result<Vec<(String, Vec<RecordBatch>)>> {
+    let mut per_host = Vec::new();
+    for (host, path) in fleet_paths_in(base) {
+        if let Some(want) = host_filter {
+            if host != want {
+                continue;
+            }
+        }
+        let batches = rust_read_agg_columns(&path)?
+            .iter()
+            .map(|b| with_host_column(b, &host))
+            .collect::<Result<Vec<_>>>()?;
+        per_host.push((host, batches));
+    }
+    Ok(per_host)
+}
+
+pub fn query_fleet_summary_in(
+    base: &Path,
+    host: Option<&str>,
+    source: Option<&str>,
+    model: Option<&str>,
+    ds: Option<i64>,
+    de: Option<i64>,
+) -> Result<FleetSummary> {
+    let per_host = read_fleet_batches(base, host)?;
+    let mut combined: Vec<RecordBatch> = Vec::new();
+    let mut by_host: Vec<FleetHostRow> = Vec::with_capacity(per_host.len());
+    let mut host_source: Vec<FleetHostSourceCell> = Vec::new();
+
+    for (host_name, batches) in &per_host {
+        let s = rust_compute_summary(batches, source, model, ds, de)?;
+        for src in &s.by_source {
+            host_source.push(FleetHostSourceCell {
+                host: host_name.clone(),
+                source: src.source.clone(),
+                requests: src.requests,
+                total_tokens: src.input_tokens
+                    + src.output_tokens
+                    + src.cache_read_tokens
+                    + src.cache_creation_tokens,
+                credits: src.credits,
+            });
+        }
+        by_host.push(FleetHostRow {
+            host: host_name.clone(),
+            requests: s.total_requests,
+            input_tokens: s.total_input_tokens,
+            output_tokens: s.total_output_tokens,
+            cache_read_tokens: s.total_cache_read_tokens,
+            cache_creation_tokens: s.total_cache_creation_tokens,
+            total_tokens: s.total_tokens,
+            credits: s.total_credits,
+            avg_context_ratio: s.avg_context_ratio,
+            sources: s.by_source.iter().map(|r| r.source.clone()).collect(),
+        });
+        combined.extend(batches.iter().cloned());
+    }
+
+    let totals_acc = rust_compute_summary(&combined, source, model, ds, de)?;
+    let input_side = totals_acc.total_input_tokens + totals_acc.total_cache_read_tokens;
+    let totals = FleetTotals {
+        hosts: by_host.len(),
+        requests: totals_acc.total_requests,
+        input_tokens: totals_acc.total_input_tokens,
+        output_tokens: totals_acc.total_output_tokens,
+        cache_read_tokens: totals_acc.total_cache_read_tokens,
+        cache_creation_tokens: totals_acc.total_cache_creation_tokens,
+        total_tokens: totals_acc.total_tokens,
+        credits: totals_acc.total_credits,
+        cache_hit_rate: (input_side > 0)
+            .then(|| totals_acc.total_cache_read_tokens as f64 / input_side as f64),
+        avg_context_ratio: totals_acc.avg_context_ratio,
+    };
+    Ok(FleetSummary {
+        totals,
+        by_host,
+        host_source,
+    })
+}
+
+pub fn query_fleet_metrics_in(
+    base: &Path,
+    host: Option<&str>,
+    source: Option<&str>,
+    model: Option<&str>,
+    ds: Option<i64>,
+    de: Option<i64>,
+) -> Result<FleetMetrics> {
+    let per_host = read_fleet_batches(base, host)?;
+    let mut by_host = Vec::with_capacity(per_host.len());
+    let mut combined: Vec<RecordBatch> = Vec::new();
+    for (host_name, batches) in &per_host {
+        let m = rust_compute_metrics(batches, source, model, ds, de)?;
+        by_host.push(FleetHostMetrics {
+            host: host_name.clone(),
+            requests: m.totals.requests,
+            avg_duration_ms: m.totals.avg_duration_ms,
+            avg_ttft_ms: m.totals.avg_ttft_ms,
+            cache_hit_rate: m.totals.cache_hit_rate,
+            output_input_ratio: m.totals.output_input_ratio,
+            avg_input_per_req: m.totals.avg_input_per_req,
+            avg_output_per_req: m.totals.avg_output_per_req,
+        });
+        combined.extend(batches.iter().cloned());
+    }
+    let totals = rust_compute_metrics(&combined, source, model, ds, de)?.totals;
+    Ok(FleetMetrics { by_host, totals })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Source;
+
+    /// R11: a flat weekday rhythm with one 10x spike flags exactly that day;
+    /// short baselines never judge.
+    #[test]
+    fn anomaly_detection_flags_spikes_only() {
+        let mut days: Vec<(String, u64)> = Vec::new();
+        // Five Mondays, ~1000 tokens each; the sixth explodes.
+        let base = chrono::NaiveDate::from_ymd_opt(2026, 7, 6).unwrap(); // a Monday
+        for w in 0..5 {
+            days.push((
+                (base + chrono::Duration::weeks(w))
+                    .format("%Y-%m-%d")
+                    .to_string(),
+                1000, // identical rhythm → MAD 0, the spike still flags
+            ));
+        }
+        let spike_date = (base + chrono::Duration::weeks(5))
+            .format("%Y-%m-%d")
+            .to_string();
+        days.push((spike_date.clone(), 10_000));
+
+        let report = detect_daily_anomalies(&days);
+        assert_eq!(report.checked_days, 6);
+        assert_eq!(report.flagged.len(), 1, "only the spike flags");
+        assert_eq!(report.flagged[0].date, spike_date);
+        assert_eq!(report.flagged[0].baseline_median, 1000);
+    }
+
+    /// Weekday stratification: 10x above *Saturday* history is not judged by
+    /// Monday's quiet rhythm.
+    #[test]
+    fn anomaly_baselines_are_weekday_stratified() {
+        let monday = chrono::NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let saturday = chrono::NaiveDate::from_ymd_opt(2026, 7, 11).unwrap();
+        let mut days: Vec<(String, u64)> = Vec::new();
+        for w in 0..4 {
+            days.push((
+                (monday + chrono::Duration::weeks(w))
+                    .format("%Y-%m-%d")
+                    .to_string(),
+                100_u64,
+            ));
+            days.push((
+                (saturday + chrono::Duration::weeks(w))
+                    .format("%Y-%m-%d")
+                    .to_string(),
+                9_000_u64,
+            ));
+        }
+        let report = detect_daily_anomalies(&days);
+        assert!(report.flagged.is_empty(), "each weekday judged by itself");
+    }
+
+    /// R8: 5h window segmentation — a window expires WINDOW_SECS after its
+    /// first request; the next request opens a new one.
+    #[test]
+    fn segment_windows_groups_by_five_hour_expiry() {
+        let five_h = WINDOW_SECS;
+        let rows = vec![
+            (1000, 100),
+            (2000, 50),
+            (1000 + five_h + 1, 7), // previous window expired → new one
+            (1000 + five_h + 2, 3),
+        ];
+        let w = segment_windows(&rows);
+        assert_eq!(w, vec![(1000, 150, 2), (1000 + five_h + 1, 10, 2)]);
+    }
+
+    #[test]
+    fn percentile90_interpolates_and_handles_tiny_samples() {
+        assert_eq!(percentile90(&mut []), 0);
+        assert_eq!(percentile90(&mut [42]), 42);
+        // [10, 20, 30, 100]: rank = 0.9*3 = 2.7 → 30 + 0.7*(100-30) = 79
+        assert_eq!(percentile90(&mut [30, 10, 100, 20]), 79);
+    }
+
+    /// R8 end to end on a temp store: open window, week totals and the P90
+    /// reference come out of the same parquet the dashboard reads.
+    #[test]
+    fn query_windows_reports_open_window_and_p90_reference() {
+        let dir = std::env::temp_dir().join(format!("tb-win-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.parquet");
+
+        let five_h = WINDOW_SECS;
+        let base = 1_800_000_000;
+        let mut records: Vec<(String, TokenRecord)> = Vec::new();
+        let push = |ts: i64, tokens: u64, records: &mut Vec<(String, TokenRecord)>| {
+            let r = TokenRecord {
+                source: Source::Claude,
+                model: "m".into(),
+                input_tokens: tokens,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                timestamp: ts,
+                session_id: None,
+                project: String::new(),
+                duration_ms: None,
+                ttft_ms: None,
+                credits: 0.0,
+                context_ratio: 0.0,
+                record_id: None,
+                merge_key: None,
+            };
+            records.push((format!("k{ts}_{tokens}"), r));
+        };
+        push(base, 500, &mut records);
+        push(base + 3600, 100, &mut records);
+        push(base + five_h + 60, 200, &mut records);
+        push(base - 29 * 86_400, 1_000_000, &mut records);
+        let batch = records_to_batch(&records);
+        write_parquet(&path, &batch).unwrap();
+
+        let store = Store {
+            parquet_path: path.clone(),
+        };
+        let facts = store.query_windows().expect("facts");
+
+        assert_eq!(facts.data_now, base + five_h + 60);
+        let open = facts.open_window.expect("window B is open");
+        assert_eq!(open.window_start, base + five_h + 60);
+        assert_eq!(open.window_tokens, 200);
+        assert_eq!(facts.week_tokens, 800);
+        assert_eq!(facts.week_requests, 3);
+        assert_eq!(facts.max_5h_tokens, 600);
+        // rank 0.9 over [200, 600] → 200 + 0.9*400 = 560
+        assert_eq!(facts.p90_5h_tokens, 560);
+        assert!(facts.p90_ratio.unwrap() < 1.0);
+        assert!(facts.hours_to_p90.unwrap() > 0.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sample_records(n: usize) -> Vec<(String, TokenRecord)> {
+        (0..n)
+            .map(|i| {
+                let r = TokenRecord {
+                    source: Source::Claude,
+                    model: "test-model".into(),
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    timestamp: 1_788_874_500 + i as i64,
+                    session_id: Some(format!("s{i}")),
+                    project: String::new(),
+                    duration_ms: Some(100),
+                    ttft_ms: None,
+                    credits: 0.0,
+                    context_ratio: 0.0,
+                    record_id: Some(format!("r{i}")),
+                    merge_key: None,
+                };
+                (format!("k{i}"), r)
+            })
+            .collect()
+    }
+
+    /// R5: a corrupt data.parquet with a readable snapshot is restored from
+    /// it; with no snapshot it is moved aside so the store starts fresh.
+    #[test]
+    fn corrupt_parquet_is_repaired_from_snapshot_or_moved_aside() {
+        let dir = std::env::temp_dir().join(format!("tb-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data.parquet");
+
+        // Case 1: no snapshot — corrupt file is moved aside, path is free.
+        std::fs::write(&data, b"definitely not parquet").unwrap();
+        repair_corrupt_parquet(&data);
+        assert!(!data.exists(), "corrupt file must be moved aside");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "kept for forensics"
+        );
+
+        // Case 2: a readable snapshot exists — it is copied over the store.
+        let snap = dir.join("data.20260901-000000.snap.parquet");
+        write_parquet(&snap, &records_to_batch(&sample_records(3))).unwrap();
+        std::fs::write(&data, b"garbage again").unwrap();
+        repair_corrupt_parquet(&data);
+        assert!(parquet_opens(&data), "store must open after repair");
+        assert_eq!(parquet_row_count(&data), 3, "restored snapshot rows");
+
+        // Case 3: healthy file — untouched.
+        repair_corrupt_parquet(&data);
+        assert_eq!(parquet_row_count(&data), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R5: the newest readable snapshot wins — an older one is skipped, and a
+    /// corrupt newest one is skipped in favour of an older readable one.
+    #[test]
+    fn newest_readable_snapshot_prefers_newest_that_opens() {
+        let dir = std::env::temp_dir().join(format!("tb-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let old = dir.join("data.20260901-000000.snap.parquet");
+        write_parquet(&old, &records_to_batch(&sample_records(1))).unwrap();
+        // A newer snapshot that is itself corrupt must not be selected.
+        let new_corrupt = dir.join("data.20260902-000000.snap.parquet");
+        std::fs::write(&new_corrupt, b"junk").unwrap();
+
+        let picked = newest_readable_snapshot(&dir).expect("old snapshot is readable");
+        assert_eq!(picked, old);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn timeline_labels_match_the_sql_formats() {
@@ -2124,11 +3529,13 @@ mod tests {
             cache_creation_tokens: 0,
             timestamp: ts,
             session_id: Some("s1".to_string()),
+            project: String::new(),
             duration_ms: None,
             ttft_ms: None,
             credits: 0.0,
             context_ratio: 0.0,
             record_id: record_id.map(|s| s.to_string()),
+            merge_key: None,
         }
     }
 
@@ -2218,6 +3625,71 @@ mod tests {
         assert_eq!(new_records.len(), 2);
     }
 
+    /// Hermes replacement filters superseded rows out of the old parquet by
+    /// `message_id` prefix; rows from every other source and every nullable
+    /// column must survive the copy untouched.
+    #[test]
+    fn without_message_prefix_drops_only_prefixed_rows() {
+        let mut updated = rec(Source::Hermes, 1_700_000_000, 500, None);
+        updated.duration_ms = Some(4_200);
+        let mut replaced = rec(Source::Hermes, 1_700_000_500, 300, None);
+        replaced.duration_ms = None;
+        let other = rec(Source::Claude, 1_700_001_000, 100, None);
+        let batch = records_to_batch(&[
+            ("hermes_s1|m|a|b|c|t".to_string(), updated),
+            ("hermes_s1|m|a|b|c|t2".to_string(), replaced),
+            ("cl_1700001000_100".to_string(), other),
+        ]);
+
+        let filtered = without_message_prefix(&batch, "hermes_");
+        assert_eq!(filtered.num_rows(), 1);
+        let src = filtered
+            .column_by_name("source")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let dur = filtered
+            .column_by_name("duration_ms")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let inp = filtered
+            .column_by_name("input_tokens")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(src.value(0), "claude");
+        assert_eq!(inp.value(0), 100);
+        assert!(dur.is_null(0), "other sources keep their null duration");
+
+        // Filtering the other side leaves both hermes rows: the prefix is
+        // what names the superseded set, everything else survives verbatim.
+        let kept = without_message_prefix(&batch, "cl_");
+        assert_eq!(kept.num_rows(), 2);
+        let src2 = kept
+            .column_by_name("source")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let dur2 = kept
+            .column_by_name("duration_ms")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(src2.value(0), "hermes");
+        assert_eq!(src2.value(1), "hermes");
+        assert_eq!(dur2.value(0), 4_200);
+        assert!(
+            dur2.is_null(1),
+            "the superseded row's null duration is preserved"
+        );
+    }
+
     /// A collector's own `record_id` wins over the fallback key and is
     /// namespaced by source, so two sources sharing an id cannot collide.
     #[test]
@@ -2269,5 +3741,161 @@ mod tests {
 
         assert_eq!((imported, skipped), (0, 1));
         assert!(new_records.is_empty());
+    }
+
+    // --- Fleet aggregation ---
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tokenbuddy-store-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir should be creatable");
+        dir
+    }
+
+    fn write_host_parquet(base: &Path, host: &str, records: &[(String, TokenRecord)]) {
+        let dir = base.join(host);
+        std::fs::create_dir_all(&dir).expect("host dir should be creatable");
+        write_parquet(&dir.join("data.parquet"), &records_to_batch(records))
+            .expect("golden host parquet should write");
+    }
+
+    /// Two fake hosts: alpha sends two plain claude requests, beta one
+    /// request with a cache read and Qoder-style credits.
+    fn golden_fleet(dir: &Path) -> Vec<(String, TokenRecord)> {
+        let alpha = vec![
+            (
+                "a1".to_string(),
+                rec(Source::Claude, 1_788_874_500, 100, None),
+            ),
+            (
+                "a2".to_string(),
+                rec(Source::Claude, 1_788_874_560, 200, None),
+            ),
+        ];
+        let mut b1 = rec(Source::Claude, 1_788_874_520, 300, None);
+        b1.cache_read_tokens = 150;
+        b1.credits = 3.0;
+        let beta = vec![("b1".to_string(), b1)];
+        write_host_parquet(dir, "alpha", &alpha);
+        write_host_parquet(dir, "beta", &beta);
+        let mut all = alpha;
+        all.extend(beta);
+        all
+    }
+
+    /// Fleet totals must equal what a single-machine summary reports over
+    /// the very same rows — the fleet path adds a dimension, not a formula.
+    #[test]
+    fn fleet_summary_totals_cross_check_against_single_machine_summary() {
+        let dir = temp_dir("fleetsum");
+        let all = golden_fleet(&dir);
+
+        let local = Store {
+            parquet_path: dir.join("all.parquet"),
+        };
+        write_parquet(&local.parquet_path, &records_to_batch(&all)).unwrap();
+        let local_summary = local.query_summary(None, None, None, None).unwrap();
+
+        let fleet = query_fleet_summary_in(&dir, None, None, None, None, None).unwrap();
+        assert_eq!(fleet.totals.hosts, 2);
+        assert_eq!(fleet.totals.requests, local_summary.total_requests);
+        assert_eq!(fleet.totals.total_tokens, local_summary.total_tokens);
+        assert_eq!(fleet.totals.input_tokens, local_summary.total_input_tokens);
+        assert_eq!(
+            fleet.totals.cache_read_tokens,
+            local_summary.total_cache_read_tokens
+        );
+        assert_eq!(fleet.totals.credits, 3.0);
+        // Input side: 600 fresh + 150 cached → hit rate exactly 0.2.
+        assert_eq!(fleet.totals.cache_hit_rate, Some(0.2));
+        // alpha = 100+1 + 200+1; beta = 300+150+1.
+        assert_eq!(fleet.totals.total_tokens, 753);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fleet_summary_host_filter_and_matrix_cells() {
+        let dir = temp_dir("fleethost");
+        golden_fleet(&dir);
+
+        let only_alpha =
+            query_fleet_summary_in(&dir, Some("alpha"), None, None, None, None).unwrap();
+        assert_eq!(only_alpha.totals.hosts, 1);
+        assert_eq!(only_alpha.totals.requests, 2);
+        assert_eq!(only_alpha.by_host.len(), 1);
+        assert_eq!(only_alpha.by_host[0].host, "alpha");
+        assert_eq!(only_alpha.by_host[0].total_tokens, 302);
+        assert!(only_alpha.host_source.iter().all(|c| c.host == "alpha"));
+
+        let full = query_fleet_summary_in(&dir, None, None, None, None, None).unwrap();
+        assert_eq!(full.by_host.len(), 2);
+        assert_eq!(full.by_host[0].host, "alpha");
+        assert_eq!(full.by_host[1].host, "beta");
+        assert_eq!(full.by_host[1].credits, 3.0);
+        assert_eq!(full.by_host[1].sources, vec!["claude"]);
+        let cells: Vec<(String, String, u64)> = full
+            .host_source
+            .iter()
+            .map(|c| (c.host.clone(), c.source.clone(), c.requests))
+            .collect();
+        assert!(cells.contains(&("alpha".to_string(), "claude".to_string(), 2)));
+        assert!(cells.contains(&("beta".to_string(), "claude".to_string(), 1)));
+        // An unknown host filter matches nothing rather than everything.
+        let none = query_fleet_summary_in(&dir, Some("ghost"), None, None, None, None).unwrap();
+        assert_eq!(none.totals.requests, 0);
+        assert!(none.by_host.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fleet_paths_require_a_landed_parquet_and_sort_by_host() {
+        let dir = temp_dir("fleetpaths");
+        let one = vec![(
+            "x".to_string(),
+            rec(Source::Claude, 1_788_874_500, 10, None),
+        )];
+        write_host_parquet(&dir, "beta", &one);
+        // Directory created but parquet still mid-download (tmp name): ignored.
+        std::fs::create_dir_all(dir.join("alpha")).unwrap();
+        std::fs::write(dir.join("alpha").join("data.parquet.tmp"), b"junk").unwrap();
+
+        let hosts: Vec<String> = fleet_paths_in(&dir).into_iter().map(|(h, _)| h).collect();
+        assert_eq!(hosts, vec!["beta"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fleet_metrics_and_models_carry_host_dimension() {
+        let dir = temp_dir("fleetmm");
+        let all = golden_fleet(&dir);
+
+        let metrics = query_fleet_metrics_in(&dir, None, None, None, None, None).unwrap();
+        assert_eq!(metrics.by_host.len(), 2);
+        assert_eq!(metrics.by_host[0].host, "alpha");
+        assert_eq!(metrics.by_host[0].requests, 2);
+        assert_eq!(metrics.by_host[1].host, "beta");
+        assert_eq!(metrics.totals.requests, 3);
+
+        let combined: Vec<RecordBatch> = read_fleet_batches(&dir, None)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, b)| b)
+            .collect();
+        let fleet_models = rust_compute_models(&combined, None, None, None, None).unwrap();
+        assert_eq!(
+            fleet_models.models.len(),
+            1,
+            "all golden rows share one model"
+        );
+        assert_eq!(fleet_models.models[0].hosts, vec!["alpha", "beta"]);
+        assert_eq!(fleet_models.models[0].requests, 3);
+
+        // The local path (no host column) must keep hosts empty, so the
+        // /api/models JSON stays identical to pre-Fleet.
+        let local_models =
+            rust_compute_models(&[records_to_batch(&all)], None, None, None, None).unwrap();
+        assert!(local_models.models[0].hosts.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

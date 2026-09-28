@@ -1,10 +1,20 @@
 pub mod claude;
+pub mod codex;
 pub mod context;
+pub mod crypt;
+pub mod doctor;
+pub mod export;
+pub mod fleet;
+pub mod gemini;
+pub mod hermes;
+pub mod mcp;
 pub mod mimo;
 pub mod minimax;
 pub mod opencode;
 pub mod pi;
 pub mod qoder;
+pub mod qwen;
+pub mod report;
 pub mod store;
 pub mod workbuddy;
 pub mod zcode;
@@ -19,6 +29,13 @@ use std::time::SystemTime;
 /// the one-time rename below carries existing data across the rebrand so an
 /// upgrade never starts from an empty store.
 pub fn data_dir() -> PathBuf {
+    // TOKENBUDDY_HOME relocates the whole store (tests, multi-instance, MCP
+    // fixtures). Migration below only runs for the default location.
+    if let Ok(home) = std::env::var("TOKENBUDDY_HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home);
+        }
+    }
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let dir = home.join(".tokenbuddy");
     if !dir.exists() {
@@ -138,6 +155,55 @@ pub fn model_family(model: &str) -> String {
     }
 }
 
+/// Upper bound on a SQLite-backed collector's `data` blob, in bytes.
+///
+/// Measured on a real mimo database: assistant turns are at most 1.7 KB, while
+/// *user* turns carry inline `data:image` screenshots — one measured 19.5 MB,
+/// and user rows hold 99% of the blob mass in a 262 MB file. Every collector
+/// already discards non-assistant rows, so that mass was being read for
+/// nothing.
+///
+/// SQLite must materialize a value before `json_extract` can walk it, and
+/// filtering on the extracted role does not help: measured, the peak is
+/// unchanged (73 MB either way). It does honour a `length()` bound without
+/// assembling the value — with this filter the same scan peaks at the
+/// "no extraction at all" floor (46 MB, against 45.6 MB for a bare scan).
+///
+/// 1 MB is ~600× the largest real assistant turn, so nothing billable is lost.
+/// Rows above it are counted and reported rather than dropped in silence.
+pub const SQLITE_BLOB_LIMIT: i64 = 1_000_000;
+
+/// The `WHERE` bound that keeps [`SQLITE_BLOB_LIMIT`] honest in a query.
+///
+/// The order of the two bounds is the whole trick, and it is measured, not
+/// guessed:
+///
+/// * `LENGTH` first. It is cheap — a bare `SELECT LENGTH(data)` over the whole
+///   table already peaks at the no-extraction floor (45.6 MB) — and it rejects
+///   the multi-megabyte rows before anything tries to look inside them.
+/// * `json_valid` second. SQLite's JSON functions *error* on malformed input
+///   rather than yielding NULL, so without it a single corrupt row aborts the
+///   whole query and silently takes the entire source dark, where the blob walk
+///   it replaced merely skipped that row. It sits before every `json_extract`
+///   so an invalid row is rejected first; SQLite evaluates `AND` terms left to
+///   right and short-circuits.
+///
+/// Swapping them costs 24 MB: `json_valid` alone must parse a 19.5 MB body to
+/// answer, so it has to materialize the very value the length bound exists to
+/// skip.
+pub const SQLITE_BLOB_FILTER: &str = "LENGTH(data) < 1000000 AND json_valid(data)";
+
+/// How many rows the blob bound skipped, for the caller to report. Uses only
+/// `length()`, so it costs a scan that never assembles a value.
+pub fn sqlite_oversized_rows(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<u64> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM {table} WHERE LENGTH(data) >= {}",
+        SQLITE_BLOB_LIMIT
+    );
+    let n: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+    Ok(n.max(0) as u64)
+}
+
 /// Per-source on-disk cache shared by the collectors: log path → (mtime when
 /// parsed, records). Unchanged files skip re-parsing on the next sync.
 pub(crate) type FileCacheMap = HashMap<String, (SystemTime, Vec<TokenRecord>)>;
@@ -152,6 +218,11 @@ pub struct TokenRecord {
     pub cache_creation_tokens: u64,
     pub timestamp: i64,
     pub session_id: Option<String>,
+    /// Project attribution when the source log provides one (cwd, workspace
+    /// directory, project slug). Empty string = the source does not say —
+    /// pivot tables must not guess (the WakaTime lesson: bad attribution is
+    /// worse than none).
+    pub project: String,
     /// Total wall-clock duration of the model call in milliseconds.
     /// `None` when the source log doesn't expose this (e.g. Claude jsonl).
     pub duration_ms: Option<u64>,
@@ -171,11 +242,20 @@ pub struct TokenRecord {
     /// whose token counts are masked would otherwise collide on the
     /// timestamp+input_tokens key the other collectors fall back to.
     pub record_id: Option<String>,
+    /// In-memory cross-file merge identity (never written to parquet, never
+    /// used for store keys — those stay frozen). A collector whose messages
+    /// can appear in several files (resume copies, sidechain replays) sets
+    /// this so its own collect pass can fold the copies into one billable
+    /// row regardless of which file they sat in.
+    pub merge_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Source {
     Claude,
+    Codex,
+    Gemini,
+    Qwen,
     OpenCode,
     Mimo,
     Zcode,
@@ -183,12 +263,16 @@ pub enum Source {
     Qoder,
     WorkBuddy,
     MiniMax,
+    Hermes,
 }
 
 impl std::fmt::Display for Source {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Source::Claude => "Claude",
+            Source::Codex => "Codex",
+            Source::Gemini => "Gemini",
+            Source::Qwen => "Qwen",
             Source::OpenCode => "OpenCode",
             Source::Mimo => "Mimo",
             Source::Zcode => "Zcode",
@@ -196,6 +280,7 @@ impl std::fmt::Display for Source {
             Source::Qoder => "Qoder",
             Source::WorkBuddy => "WorkBuddy",
             Source::MiniMax => "MiniMax",
+            Source::Hermes => "Hermes",
         })
     }
 }
@@ -204,6 +289,9 @@ impl Source {
     pub fn as_str(&self) -> &str {
         match self {
             Source::Claude => "claude",
+            Source::Codex => "codex",
+            Source::Gemini => "gemini",
+            Source::Qwen => "qwen",
             Source::OpenCode => "opencode",
             Source::Mimo => "mimo",
             Source::Zcode => "zcode",
@@ -211,6 +299,7 @@ impl Source {
             Source::Qoder => "qoder",
             Source::WorkBuddy => "workbuddy",
             Source::MiniMax => "minimax",
+            Source::Hermes => "hermes",
         }
     }
 }

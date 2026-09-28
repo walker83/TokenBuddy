@@ -1,10 +1,29 @@
-use crate::{Source, TokenRecord};
+use crate::{Source, TokenRecord, SQLITE_BLOB_FILTER};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
 static SQLITE_CACHE: Mutex<Option<(SystemTime, Vec<TokenRecord>)>> = Mutex::new(None);
+
+/// Drop the resident parse cache. The cache only exists to make a *second*
+/// sync cheaper than the first; left in place it pins every record of every
+/// session log in the heap for the life of the process, growing with total
+/// history and eating the resident-memory budget the dashboard is measured
+/// against. `store::sync` calls this once the parquet has been written, so
+/// the saving is paid back only by whoever asks for the next sync.
+pub fn release_caches() {
+    let mut cache = SQLITE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *cache = None;
+}
+
+/// Where this collector reads from, when that place exists on this machine.
+/// Powers the dashboard's source-health panel and the first-run prompt, so a
+/// user with a missing or unmoved tool directory is told which one instead of
+/// just seeing zeros.
+pub fn log_path() -> Option<std::path::PathBuf> {
+    log_paths().into_iter().find(|p| p.exists())
+}
 
 pub fn collect_records() -> Result<Vec<TokenRecord>> {
     let db_path = get_opencode_db_path();
@@ -36,6 +55,12 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
     // checkpointed recently. We only issue SELECTs so the RW handle is safe.
     let conn = rusqlite::Connection::open(db_path)?;
 
+    // A tool that is mid-write holds an exclusive lock on its own database.
+    // Without a busy timeout the SELECT fails instantly with SQLITE_BUSY —
+    // and before sync became per-collector fault-tolerant, that single
+    // locked database voided every other source's import as well.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+
     // OpenCode shipped two SQLite shapes:
     //   - v1 (<= ~2025): table `message` with role + token counts inside JSON.
     //   - v2 (>= 2026): table `session_message` per-message rows but token
@@ -44,31 +69,41 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
     //     `tokens` object). See PR feat/opencode-v2-on-gitea.
     // Detect at runtime so both stay supported without forcing users onto
     // a specific OpenCode version.
-    let (sql, is_v2) = if crate::context::sqlite_table_exists(&conn, "session_message") {
-        // v2 — token counts live on session_v2, one row per session.
-        (
-            "SELECT s.id, s.time_created, s.model, s.agent, \
-                    s.tokens_input, s.tokens_output, s.tokens_cache_read, s.tokens_cache_write \
+    let (sql, is_v2): (String, bool) =
+        if crate::context::sqlite_table_exists(&conn, "session_message") {
+            // v2 — token counts live on session_v2, one row per session.
+            (
+                "SELECT s.id, s.time_created, s.model, s.agent, \
+                    s.tokens_input, s.tokens_output, s.tokens_cache_read, s.tokens_cache_write, \
+                    s.directory \
              FROM session_v2 s \
              WHERE s.tokens_input > 0 OR s.tokens_output > 0 \
-             ORDER BY s.time_created ASC",
-            true,
-        )
-    } else if crate::context::sqlite_table_exists(&conn, "message") {
-        // v1 — per-message rows, role + tokens in `data` JSON.
-        (
-            "SELECT id, session_id, time_created, data \
-             FROM message \
-             ORDER BY time_created ASC",
-            false,
-        )
-    } else {
-        // Neither table present — nothing to read; surface as empty so
-        // the collector quietly moves on instead of blowing up.
-        return Ok(Vec::new());
-    };
+             ORDER BY s.time_created ASC"
+                    .to_string(),
+                true,
+            )
+        } else if crate::context::sqlite_table_exists(&conn, "message") {
+            // v1 — per-message rows, role + tokens in `data` JSON. The blob bound
+            // keeps an inline screenshot from ever being assembled into the heap;
+            // see `SQLITE_BLOB_LIMIT` for the measurement behind it, and note the
+            // role filter alone would not have helped.
+            (
+                format!(
+                    "SELECT id, session_id, time_created, data \
+                 FROM message \
+                 WHERE {SQLITE_BLOB_FILTER} \
+                   AND json_extract(data, '$.role') = 'assistant' \
+                 ORDER BY time_created ASC"
+                ),
+                false,
+            )
+        } else {
+            // Neither table present — nothing to read; surface as empty so
+            // the collector quietly moves on instead of blowing up.
+            return Ok(Vec::new());
+        };
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
 
     let mut records = Vec::new();
     let mut rows = stmt.query([])?;
@@ -84,6 +119,7 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
             let output_tokens: u64 = row.get(5)?;
             let cache_read: u64 = row.get(6)?;
             let cache_write: u64 = row.get(7)?;
+            let directory: Option<String> = row.get(8).ok();
             // v2 `model` is JSON `{"id":"...","providerID":"opencode","variant":"..."}`.
             let model_id = serde_json::from_str::<serde_json::Value>(&model_raw)
                 .ok()
@@ -103,11 +139,13 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
                 cache_creation_tokens: cache_write,
                 timestamp: time_created_ms / 1000,
                 session_id: Some(session_id),
+                project: directory.unwrap_or_default(),
                 duration_ms: None,
                 ttft_ms: None,
                 credits: 0.0,
                 context_ratio: 0.0,
                 record_id: None,
+                merge_key: None,
             });
             continue;
         }
@@ -122,6 +160,8 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
             Err(_) => continue,
         };
 
+        // The query already filtered on role; this stays as the guard for the
+        // shape of the row itself.
         if value.get("role").and_then(|v| v.as_str()) != Some("assistant") {
             continue;
         }
@@ -190,11 +230,13 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
             cache_creation_tokens: cache_write,
             timestamp: timestamp_secs,
             session_id: Some(session_id),
+            project: String::new(),
             duration_ms,
             ttft_ms: None,
             credits: 0.0,
             context_ratio: 0.0,
             record_id: None,
+            merge_key: None,
         });
     }
 
@@ -204,6 +246,12 @@ fn read_all_records(db_path: &Path) -> Result<Vec<TokenRecord>> {
 // Storage location for context search; see `context.rs`.
 pub(crate) fn db_path() -> PathBuf {
     get_opencode_db_path()
+}
+
+/// Candidate log locations, for `tokenbuddy doctor`: presence is optional,
+/// the doctor reports what exists and what does not.
+pub fn log_paths() -> Vec<PathBuf> {
+    vec![get_opencode_db_path()]
 }
 
 fn get_opencode_db_path() -> PathBuf {
