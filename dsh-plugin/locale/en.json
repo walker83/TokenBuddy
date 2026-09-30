@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "TokenBuddy — Token Ledger & Session Search",
+    "description": "Answers “where did my tokens go this week?” and “where did we discuss X?” from your local ledger: token usage by model/project/hour, cache hits, quota windows, plus full-text search across every AI coding conversation on this machine. Data stays on 127.0.0.1 — same numbers as the TokenBuddy dashboard."
+  }
+}

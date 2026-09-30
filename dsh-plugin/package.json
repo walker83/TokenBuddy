@@ -1,0 +1,23 @@
+{
+  "name": "dsh-plugin-tokenbuddy",
+  "version": "0.8.0",
+  "description": "TokenBuddy — local token ledger & AI conversation search for DeepSeek Harness",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "icon": "icon.png",
+  "files": ["index.js", "cordis.patch.yml", "icon.png", "locale/"],
+  "exports": {
+    ".": "./index.js",
+    "./locale/*": "./locale/*"
+  },
+  "keywords": ["dsh-plugin", "tokenbuddy", "deepseek-harness"],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
