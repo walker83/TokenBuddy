@@ -1,0 +1,83 @@
+[package]
+name = "tokenbuddy"
+description = "TokenBuddy — local-first token usage, session analytics and full-text context search for AI coding agents"
+license = "MIT"
+repository = "https://github.com/walker83/TokenBuddy"
+version = "0.10.0"
+edition = "2021"
+rust-version = "1.75"
+
+[[bin]]
+name = "tokenbuddy"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+rusqlite = { version = "0.31" }
+arrow = "58"
+parquet = { version = "58", features = ["zstd"] }
+anyhow = ">=1.0.103"
+tiny_http = "0.12"
+zstd = "0.13"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+# Fleet at-rest encryption (opt-in `encrypt = true`): XChaCha20-Poly1305
+# from RustCrypto — pure Rust, widely reviewed, no C toolchain. hkdf derives
+# the content key from the existing S3 secret_key, so users add no new
+# secret to manage.
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+libc = "0.2"
+# Fleet sync talks to a LAN S3 endpoint (RustFS) in plain HTTP; the TLS
+# feature is deliberately off to keep the binary small. The gateway's
+# upstream calls DO need TLS (rustls, pure Rust) — it comes in only with
+# the `gateway` feature so a gateway-less build keeps the old footprint.
+ureq = { version = "2", default-features = false }
+# Qoder 反向代理(R109)的 COSY 签名:AES-128-CBC + RSA-PKCS1v15 + MD5 +
+# base64 + rand_core——全部纯 Rust,无 C 工具链;optional 只随 gateway feature 进入。
+aes = { version = "0.8", optional = true }
+cbc = { version = "0.1", optional = true, features = ["block-padding"] }
+md-5 = { version = "0.10", optional = true }
+rsa = { version = "0.9", optional = true, features = ["pem"] }
+base64 = { version = "0.22", optional = true }
+# rsa::encrypt 需要 RngCore;不引完整 rand,只取 rand_core(rsa 同款 0.6)。
+rand_core = { version = "0.6", optional = true }
+
+[features]
+default = ["gateway"]
+# Gateway proxy (R108): local OpenAI/Anthropic-compatible endpoint that
+# meters traffic into the ledger. Pulled in by default; `--no-default-features`
+# builds today's binary without any gateway code path.
+gateway = ["ureq/tls", "dep:aes", "dep:cbc", "dep:md-5", "dep:rsa", "dep:base64", "dep:rand_core"]
+
+
+[build-dependencies]
+zstd = "0.13"
+
+[lib]
+name = "tokenbuddy"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+# Issue #1 bug 4: a full release build costs ~4 min on an Android/Termux
+# dev box — too slow for an edit-test loop. `cargo build --profile fast`
+# (opt-level 1, no LTO, incremental, parallel codegen) trades binary size
+# and peak speed for iteration time; tests keep the same semantics.
+# Shipped artifacts and the size gate stay on --release; check.sh is
+# unaffected. The dir is target/fast, so it never mixes with target/release.
+[profile.fast]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 16
+incremental = true
+strip = false

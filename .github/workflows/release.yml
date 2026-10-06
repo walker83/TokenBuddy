@@ -1,0 +1,92 @@
+name: release
+
+# Prebuilt binaries for the two release targets, published to a GitHub
+# release. Triggered by pushing a v* tag — building is cheap (48 s), the
+# size guard runs per target so a fat binary can never ship.
+#
+# Local gates (scripts/check.sh) already ran via ci.yml on the same commit;
+# this workflow only cross-compiles and packages.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: apple-silicon
+          # Cross-compiled from the arm64 runner — rustc handles the
+          # x86_64-apple-darwin backend natively, no extra toolchain needed.
+          # install.sh maps Darwin/x86_64 users here; without it they had to
+          # build from source.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: mac-intel
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: linux-x64
+          # Native build on the free arm64 runner; install.sh maps
+          # Linux/aarch64 here and expects the gnu triple.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            name: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install target
+        run: rustup target add ${{ matrix.target }}
+      - name: musl toolchain (linux only)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build (release, stripped by profile)
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Size guard (release parity with check.sh)
+        run: |
+          bin=target/${{ matrix.target }}/release/tokenbuddy
+          size=$(wc -c < "$bin")
+          echo "binary: $size bytes"
+          limit=$((20 * 1024 * 1024))
+          [ "$size" -le "$limit" ] || { echo "over 20 MB budget"; exit 1; }
+      # Names match scripts/install.sh exactly: tokenbuddy-<version>-<target>
+      # (version without the leading v), so the installer's URL builder and
+      # shasum -a 256 verification work unchanged.
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [ -n "$version" ] || version="dev"
+          bin=target/${{ matrix.target }}/release/tokenbuddy
+          dir=tokenbuddy-${version}-${{ matrix.target }}
+          mkdir "$dir"
+          cp "$bin" "$dir/tokenbuddy"
+          cp README.md README.zh-CN.md LICENSE "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+          (command -v sha256sum >/dev/null && sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256") || shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenbuddy-${{ matrix.name }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            *.tar.gz.sha256
+          generate_release_notes: true
