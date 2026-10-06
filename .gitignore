@@ -1,0 +1,39 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# IDEs
+.idea/
+.vscode/
+.qoder/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+tokenbuddy.log
+
+# Build artifacts
+*.pdb
+*.dll
+*.so
+*.dylib
+
+# Test coverage
+*.profraw
+*.profdata
+coverage/
+
+# Environment
+.env
+.env.*
+
+# Local agent tool state
+.workbuddy/
+.zcode/
+dist/

@@ -583,6 +583,7 @@ parameters are ignored for forward compatibility.
 | GET | `/api/fleet/summary?timeRange=&source=&model=&host=` | fleet totals + per-host rows + host × source matrix |
 | GET | `/api/fleet/metrics?…` | latency/cache panel keyed by host |
 | GET | `/api/fleet/models?…` | model comparison across hosts |
+| GET/POST | `/api/update[/check\|/install\|/config]` | self-update: status / check now / one-click upgrade (sha256-verified download, atomic binary swap, auto-rollback) / config — every outbound call is off by default |
 
 </details>
 

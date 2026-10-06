@@ -454,6 +454,10 @@ fn api_endpoints() -> serde_json::Value {
         e("GET", "/api/quota/config", "读 quota.json 配置(parsers + sources 名册 + disabled_sources 停用开关)"),
         e("POST", "/api/quota/config", "校验并原子写 quota.json(0600;disabled_sources 停用源,下次 sync 生效)"),
         e("POST", "/api/quota/refresh", "显式运行 quota.json 里的命令采集器并落盘(不配置则无进程可跑)"),
+        e("GET", "/api/update", "自升级状态:当前版本/部署方式(github|git)/配置/最近一次检查结果(纯本地读,零网络)"),
+        e("POST", "/api/update/check", "立即检查更新(GitHub release 或 git fetch;默认关闭,须 update.json enabled=true)"),
+        e("POST", "/api/update/install", "一键升级:下载+校验+换二进制+重启,失败自动回滚 .bak;仅显式触发,没有后台自动装(github 静默升级须显式开 auto_install)"),
+        e("POST", "/api/update/config", "写 update.json(0600):enabled/auto_install/interval_hours(1–168)/mode(auto|github|git)"),
         e("GET", "/api/anomalies", "日用量异常（审计窗内建 56 天，不接受参数）"),
         e("GET", "/api/pivot?start=&end=", "项目 × 模型透视（start/end: epoch 秒，可省略）"),
         e("GET", "/api/active-time?days=7", "投入时长:按日活跃小时+按来源/项目拆分(days: 1–365;15 分钟间隔会话化,日合计为真实墙钟时间)"),
@@ -628,6 +632,7 @@ fn usage() -> String {
          \x20 tokenbuddy gateway          网关:status | on | off | probe | key add/list/remove <标签> | setup <工具> | restore <工具>\n\
          \x20 tokenbuddy push           同步本地数据并推送到 Fleet\n\
          \x20 tokenbuddy fleet-sync    拉取全部主机的 Fleet 数据\n\
+         \x20 tokenbuddy update [--check|--install]  检查更新/一键升级(默认关闭不外呼;面板 ⬆ 或 update.json 可启用自动检查)\n\
          \n\
          选项：\n\
          \x20 --port <端口>     监听端口，默认 {DEFAULT_PORT}（也可用环境变量 TOKENBUDDY_PORT）\n\
@@ -783,6 +788,7 @@ fn main() -> Result<()> {
             return cmd_report(days, json);
         }
         Some("mcp") => return tokenbuddy::mcp::run(),
+        Some("update") => return cmd_update(&positional[1..]),
         Some("gateway") => return cmd_gateway(&positional[1..]),
         Some("doctor") => {
             let json = positional.iter().any(|a| a == "--json");
@@ -875,6 +881,13 @@ fn main() -> Result<()> {
                 .unwrap_or_default(),
         ),
     );
+
+    // issue #56:把监听端口交给升级模块(runner 兜底重启按端口找旧进程),
+    // 后台检查线程自转——update.json 未启用时它 5 分钟醒一次看配置,零外呼。
+    tokenbuddy::update::set_serve_port(port);
+    {
+        std::thread::spawn(tokenbuddy::update::background_loop);
+    }
 
     // R104: the search index builds itself — once in the background at
     // startup, and again after every successful sync — so opening search is
@@ -1402,6 +1415,41 @@ fn serve_one(
                 Err(_) => error_response(&anyhow::anyhow!("请求体过大")),
             }
         }
+        // ---- issue #56 自升级(默认零外呼;install 只由显式调用触发) ----
+        ("GET", path) if route_is(path, "/api/update") => {
+            json_response(tokenbuddy::update::status_json())
+        }
+        ("POST", path) if route_is(path, "/api/update/check") => {
+            match tokenbuddy::update::check_and_record() {
+                Ok(_) => json_response(tokenbuddy::update::status_json()),
+                Err(e) => error_response(&e),
+            }
+        }
+        ("POST", path) if route_is(path, "/api/update/install") => {
+            match tokenbuddy::update::start_install() {
+                Ok(target) => {
+                    // 回完这句就退位:runner 已经拿走了安装权,服务管理器
+                    // (launchd/systemd/runsv)或 runner 裸起会把新二进制拉回。
+                    tokenbuddy::update::schedule_self_exit();
+                    json_response(
+                        serde_json::json!({ "started": true, "target": target }).to_string(),
+                    )
+                }
+                Err(e) => error_response(&e),
+            }
+        }
+        ("POST", path) if route_is(path, "/api/update/config") => {
+            match read_capped_body(&mut request, MAX_CONFIG_BODY_BYTES) {
+                Ok(body) => match serde_json::from_str::<tokenbuddy::update::UpdateConfig>(&body)
+                    .map_err(|e| anyhow::anyhow!("配置格式不合法:{e}"))
+                    .and_then(|cfg| tokenbuddy::update::save_config(&cfg).map(|_| cfg))
+                {
+                    Ok(_) => json_response(tokenbuddy::update::status_json()),
+                    Err(e) => error_response(&e),
+                },
+                Err(_) => error_response(&anyhow::anyhow!("请求体过大")),
+            }
+        }
         // ---- R108 网关管理(仪表盘进程内操作运行时;密钥只签发不回读) ----
         #[cfg(feature = "gateway")]
         ("GET", "/api/gateway") => match handle_gateway_status(store) {
@@ -1621,6 +1669,39 @@ fn serve_one(
     };
 
     let _ = request.respond(with_security_headers(response));
+}
+
+/// `tokenbuddy update [--check|--install]` — issue #56 的 CLI 入口。检查是
+/// 唯一默认动作;--install 起 runner 后立刻返回(装与重启是 runner 的事,
+/// 日志在 ~/.tokenbuddy/update.log)。命令行显式调用本身就是「用户点头」,
+/// 不会偷改任何配置。
+fn cmd_update(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--install") {
+        let target = tokenbuddy::update::start_install()?;
+        println!("升级已在后台开始 → {target}");
+        println!(
+            "日志:{}/update.log —— 新二进制就位后服务自动重启(失败自动回滚)",
+            tokenbuddy::data_dir().display()
+        );
+        return Ok(());
+    }
+    let result = tokenbuddy::update::check_and_record()?;
+    if !result.error.is_empty() {
+        return Err(anyhow::anyhow!("检查失败:{}", result.error));
+    }
+    println!(
+        "部署方式:{} · 当前版本 {}",
+        result.mode, result.current_version
+    );
+    if result.update_available {
+        println!(
+            "发现新版本 {} —— 运行 `tokenbuddy update --install` 安装,或在面板 ⬆ 里点「一键升级」",
+            result.latest_version
+        );
+    } else {
+        println!("已是最新版本");
+    }
+    Ok(())
 }
 
 /// `tokenbuddy push` — sync local collectors, then PutObject the fresh

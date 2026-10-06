@@ -465,6 +465,13 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
 .chip-btn { background: var(--panel2); border: 1px solid var(--border); color: var(--muted); font-size: 11.5px; font-family: inherit; padding: 4px 11px; border-radius: 999px; cursor: pointer; white-space: nowrap; }
 .chip-btn:hover { color: var(--text); }
 .chip-btn.alert { color: var(--over); border-color: rgba(215,0,21,.35); background: rgba(215,0,21,.06); }
+
+/* issue #56:更新面板 */
+#updateToggle { position: relative; }
+.update-dot { position: absolute; top: -3px; right: -3px; width: 8px; height: 8px; border-radius: 50%; background: #ff3b30; box-shadow: 0 0 0 2px #fff; }
+.update-status { font-size: 12.5px; color: var(--muted); line-height: 1.7; margin-bottom: 10px; }
+.update-actions { display: flex; gap: 8px; margin-bottom: 10px; }
+.update-cfg { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); padding-top: 10px; }
 .health-panel { position: absolute; right: var(--page-pad); top: 100%; width: 420px; max-width: calc(100vw - 2 * var(--page-pad)); max-height: 72vh; overflow-y: auto; background: #fff; border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow-lift); padding: 15px; z-index: 120; text-align: left; }
 .health-panel h3 { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 10px; }
 .health-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--border); font-size: 12.5px; }
@@ -549,6 +556,22 @@ footer { margin-top: 0; padding: 26px 24px 42px; color: var(--faint); font-size:
       <button class="btn primary btn-sm" onclick="sync()">同步数据</button>
       <button class="chip-btn" id="langToggle" onclick="toggleLang(event)" title="切换语言 / Switch language">EN</button>
       <button class="chip-btn" id="notifToggle" onclick="toggleNotif(event)" title="窗口滚动提醒：临近滚动且余量足时提醒你用掉，每窗口只提醒一次 / Rollover notice">🔔</button>
+      <div style="position:relative">
+        <button class="chip-btn" id="updateToggle" onclick="toggleUpdatePanel(event)" title="软件更新：检查新版本 / Software update">⬆<span id="updateDot" class="update-dot hidden"></span></button>
+        <div id="updatePanel" class="health-panel hidden" style="width:380px" role="region" aria-label="软件更新">
+          <h3>软件更新</h3>
+          <div id="updateStatus" class="update-status">加载中…</div>
+          <div class="update-actions">
+            <button class="btn ghost btn-sm" onclick="runUpdateCheck()">检查更新</button>
+            <button class="btn primary btn-sm hidden" id="updateInstallBtn" onclick="runUpdateInstall()">一键升级</button>
+          </div>
+          <div class="update-cfg">
+            <label class="cfg-check"><input type="checkbox" id="updEnabled" onchange="saveUpdateConfig()"> 自动检查（按间隔访问发布源，默认关）</label>
+            <label class="cfg-check"><input type="checkbox" id="updAutoInstall" onchange="saveUpdateConfig()"> 自动安装（静默升级，仅 release 安装方式）</label>
+            <div class="dd-hint" style="padding:2px 0 0">升级=下载→校验→换二进制→自动重启，失败自动回滚；日志 ~/.tokenbuddy/update.log</div>
+          </div>
+        </div>
+      </div>
       <button class="chip-btn" id="helpToggle" onclick="toggleHelp(true)" title="新手引导 / Help">?</button>
       <button class="nav-search-btn" id="searchToggle" title="搜索（快捷键 /）">
         <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -3266,6 +3289,112 @@ async function loadCtxQuality() {
 }
 loadCtxQuality();
 
+/* ---------- issue #56:检查更新 + 一键升级 ---------- */
+let UPDATE_D = null;
+
+async function loadUpdateStatus() {
+  try {
+    const res = await fetch('/api/update');
+    UPDATE_D = await res.json();
+  } catch (_) { UPDATE_D = null; }
+  renderUpdatePanel();
+}
+function updateStatusText(d) {
+  if (!d) return '状态不可用';
+  const lines = [`当前版本 v${d.current_version} · 部署方式 ${d.mode}`];
+  const lc = d.last_check;
+  if (d.install_in_progress) lines.push('⏳ 升级进行中——服务将自动重启…');
+  else if (lc && lc.error) lines.push(`⚠ 上次检查失败：${lc.error}`);
+  else if (lc && lc.update_available) lines.push(`⬆ 新版本 ${lc.latest_version} 可用（当前 v${lc.current_version}）`);
+  else if (lc && lc.latest_version) lines.push('✓ 已是最新');
+  else lines.push('尚未检查——检查会按配置访问发布源（默认关闭，纯本地用可以不开）');
+  if (lc && lc.checked_at) {
+    const t = new Date(lc.checked_at * 1000);
+    if (!isNaN(t)) lines.push(`<span style="color:var(--faint)">上次检查：${t.toLocaleString('zh-CN')}</span>`);
+  }
+  return lines.join('<br>');
+}
+function renderUpdatePanel() {
+  const d = UPDATE_D;
+  const st = document.getElementById('updateStatus');
+  if (st && d) st.innerHTML = updateStatusText(d);
+  const avail = !!(d && d.last_check && d.last_check.update_available && !d.install_in_progress);
+  const dot = document.getElementById('updateDot');
+  if (dot) dot.classList.toggle('hidden', !avail);
+  const btn = document.getElementById('updateToggle');
+  if (btn) btn.classList.toggle('alert', avail);
+  const inst = document.getElementById('updateInstallBtn');
+  if (inst) inst.classList.toggle('hidden', !avail);
+  const cfg = d && d.config;
+  if (cfg) {
+    const en = document.getElementById('updEnabled'), ai = document.getElementById('updAutoInstall');
+    if (en) en.checked = !!cfg.enabled;
+    if (ai) ai.checked = !!cfg.auto_install;
+  }
+}
+function toggleUpdatePanel(ev) {
+  if (ev) ev.stopPropagation();
+  const el = document.getElementById('updatePanel');
+  if (!el) return;
+  if (el.classList.contains('hidden')) {
+    el.classList.remove('hidden');
+    if (!UPDATE_D) loadUpdateStatus(); else renderUpdatePanel();
+  } else el.classList.add('hidden');
+}
+async function runUpdateCheck() {
+  const st = document.getElementById('updateStatus');
+  st.innerHTML = '检查中…（访问发布源，最长约 15s）';
+  try {
+    const res = await fetch('/api/update/check', { method: 'POST' });
+    UPDATE_D = await res.json();
+  } catch (e) { st.textContent = '检查失败：' + e.message; return; }
+  renderUpdatePanel();
+}
+async function runUpdateInstall() {
+  const d = UPDATE_D;
+  const target = d && d.last_check ? String(d.last_check.latest_version) : '';
+  if (!confirm(`升级到 ${target}？\n\n后台下载→校验→换二进制→自动重启，通常 1–2 分钟；失败自动回滚。期间服务短暂失联，恢复后本页自动刷新。`)) return;
+  const st = document.getElementById('updateStatus');
+  st.innerHTML = '⏳ 升级进行中——下载/校验/重启，服务恢复后自动刷新…';
+  try { await fetch('/api/update/install', { method: 'POST' }); } catch (_) { /* 旧进程可能已退出,响应断了是预期 */ }
+  pollUpgrade(target);
+}
+// 轮询 /api/status:版本号变成目标版本 → 刷新页面;服务失联继续等
+function pollUpgrade(target, tries) {
+  const n = tries || 0;
+  setTimeout(async () => {
+    try {
+      const res = await fetch('/api/status');
+      const d = await res.json();
+      if (target && String(d.version) === target.replace(/^v/, '')) { location.reload(); return; }
+    } catch (_) { /* 重启中 */ }
+    if (n > 60) {
+      const st = document.getElementById('updateStatus');
+      if (st) st.innerHTML = '⌛ 等待超时——看 ~/.tokenbuddy/update.log，或稍后手动刷新';
+      return;
+    }
+    pollUpgrade(target, n + 1);
+  }, 3000);
+}
+async function saveUpdateConfig() {
+  const body = {
+    enabled: document.getElementById('updEnabled').checked,
+    auto_install: document.getElementById('updAutoInstall').checked,
+    interval_hours: (UPDATE_D && UPDATE_D.config && UPDATE_D.config.interval_hours) || 24,
+    mode: (UPDATE_D && UPDATE_D.config && UPDATE_D.config.mode) || 'auto',
+  };
+  try {
+    const res = await fetch('/api/update/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    UPDATE_D = await res.json();
+    renderUpdatePanel();
+  } catch (_) {}
+}
+loadUpdateStatus();
+
 /* ---------- 命中 → 所在会话上下文 ---------- */
 
 // The one open panel and the button that opened it, so both can be reset
@@ -4428,6 +4557,16 @@ const I18N = {
   "（或对应 agent 的 skills 目录;装好即可让它直查本机 TokenBuddy API）":"(or your agent's skills directory; installed, it can query the local TokenBuddy API directly)",
   "↻ 重建索引":"↻ Rebuild index", "检索质量加载中…":"Loading search quality…",
   "索引状态与检索质量":"Index status & search quality",
+  "软件更新":"Software update", "检查更新":"Check for updates", "一键升级":"One-click upgrade",
+  "自动检查（按间隔访问发布源，默认关）":"Check automatically (hits the release feed on an interval, off by default)",
+  "自动安装（静默升级，仅 release 安装方式）":"Install automatically (silent upgrade, release installs only)",
+  "升级=下载→校验→换二进制→自动重启，失败自动回滚；日志 ~/.tokenbuddy/update.log":"Upgrade = download → verify → swap binary → auto restart; rolls back on failure. Log: ~/.tokenbuddy/update.log",
+  "状态不可用":"Status unavailable", "✓ 已是最新":"✓ Up to date",
+  "尚未检查——检查会按配置访问发布源（默认关闭，纯本地用可以不开）":"Not checked yet — a check hits the release feed per config (off by default; purely local use can leave it off)",
+  "检查中…（访问发布源，最长约 15s）":"Checking… (hits the release feed, up to ~15s)",
+  "⏳ 升级进行中——服务将自动重启…":"⏳ Upgrading — the service will restart…",
+  "⏳ 升级进行中——下载/校验/重启，服务恢复后自动刷新…":"⏳ Upgrading — download/verify/restart; this page refreshes when the service is back…",
+  "⌛ 等待超时——看 ~/.tokenbuddy/update.log，或稍后手动刷新":"⌛ Timed out — see ~/.tokenbuddy/update.log, or refresh later",
   "模型":"Model", "来源":"Source",
   "28 天内窗口样本不足":"Not enough 5h-window samples in 28 days",
   "投入时长":"Active time", "工作收据（ZCode）":"Work receipts (ZCode)",
@@ -4560,7 +4699,11 @@ const I18N_PATTERNS = [
   [/^(\d+) 条命中 · tier (.+?) · 有效词 (.+?) · 候选池 (.+?) · 验证 (.+?) · 耗时 (.+)$/, m => `${m[1]} hits · tier ${m[2]} · effective terms ${m[3]} · pool ${m[4]} · verified ${m[5]} · ${m[6].replace(/· 已合并 (\d+) 条近似回复/g, '· $1 near-duplicates merged').replace(/· 软AND兜底 (\d+)/g, '· soft-AND backfill $1')}`],
   [/^(.+) · 会话 ([0-9a-zA-Z_-]{8,})$/, m => `${m[1]} · session ${m[2]}`],
   [/^⚠ (.+?) 用量 (.+)，偏离同星期基线 (.+)（稳健 z=(.+?)）。近 (\d+) 天共 (\d+) 个异常日。$/, m => `⚠ ${m[1]} usage ${m[2]}, off the same-weekday baseline ${m[3]} (robust z=${m[4]}). ${m[5]} days audited, ${m[6]} anomalous.`],
-  [/^索引就绪 · (.+) 条对话$/, m => `Index ready · ${m[1]} conversations`]
+  [/^索引就绪 · (.+) 条对话$/, m => `Index ready · ${m[1]} conversations`],
+  [/^当前版本 v(.+) · 部署方式 (.+)$/, m => `Current v${m[1]} · install mode ${m[2]}`],
+  [/^⬆ 新版本 (.+) 可用（当前 v(.+)）$/, m => `⬆ ${m[1]} available (current v${m[2]})`],
+  [/^⚠ 上次检查失败：(.+)$/, m => `⚠ Last check failed: ${m[1]}`],
+  [/^上次检查：(.+)$/, m => `Last check: ${m[1]}`]
 ];
 function translateOne(text) {
   const c = text.trim();

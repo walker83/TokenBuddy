@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TokenBuddy as a macOS background service (launchd user agent).
+
+  Install:
+    sed -e "s|__BIN__|$HOME/.local/bin/tokenbuddy|" \
+        -e "s|__LOG__|$HOME/.tokenbuddy/tokenbudd.log|" \
+        scripts/tokenbuddy.plist.in > ~/Library/LaunchAgents/com.tokenbuddy.server.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tokenbuddy.server.plist
+
+  Uninstall:
+    launchctl bootout gui/$(id -u)/com.tokenbuddy.server
+    rm ~/Library/LaunchAgents/com.tokenbuddy.server.plist
+
+  `scripts/install.sh --service` does all of the above for you.
+
+  TOKENBUDDY_NO_OPEN is set because a service has no terminal and no human
+  watching: opening a browser window on every restart (including every login)
+  is exactly the surprise a background agent must not spring. KeepAlive means
+  a crash comes back on its own.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tokenbuddy.server</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN__</string>
+    <string>serve</string>
+    <string>--port</string>
+    <string>8080</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TOKENBUDDY_NO_OPEN</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__LOG__</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG__</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>

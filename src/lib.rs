@@ -24,6 +24,7 @@ pub mod quota;
 pub mod qwen;
 pub mod report;
 pub mod store;
+pub mod update;
 pub mod workbuddy;
 pub mod zcode;
 

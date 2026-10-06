@@ -63,6 +63,7 @@ TokenBuddy 服务在本机运行（默认 `http://127.0.0.1:8080`，只绑定本
 | `/api/active-time?days=7` | 投入时长：每日活跃小时+按来源/项目拆分（15 分钟间隔会话化） |
 | `/api/quota` | 套餐余量：Codex/Claude 文件源实时读 + 命令采集器最近结果 + 消耗曲线（只读，不触发采集命令） |
 | `POST /api/quota/refresh` | 显式运行 quota.json 里的命令采集器并落盘 |
+| `/api/update` | 自升级状态（当前版本/部署方式/最近检查；纯本地读零网络）。`POST /api/update/check` 检查、`POST /api/update/install` 一键升级（失败回滚）、`POST /api/update/config` 写开关——**默认全关不外呼**，install 只由显式调用触发 |
 | `/api/fleet/quota` | Fleet 各主机套餐余量（fleet-sync 拉回的副本） |
 | `POST /api/sync?mode=incremental\|full` | 拉取最新日志（自动刷新索引；顺带采样套餐快照） |
 
