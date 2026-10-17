@@ -1,0 +1,15 @@
+# Cargo doesn't allow user aliases that shadow built-in commands
+# (e.g. `build = "build --release"` is ignored).
+# Use the short aliases below for release builds.
+#
+#   cargo b    == cargo build --release
+#   cargo r    == cargo run   --release
+#   cargo c    == cargo check --release
+#
+# Need a real dev build?   NO — debug builds are NOT allowed in this
+# repo (see CLAUDE.md). Never run plain `cargo build` / `cargo test` /
+# `cargo run`, and never use `--profile dev`.
+[alias]
+b = "build --release"
+r = "run --release"
+c = "check --release"
