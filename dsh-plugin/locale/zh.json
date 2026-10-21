@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "TokenBuddy — Token 账本与会话搜索",
+    "description": "回答“这周 Token 烧在哪”和“当时在哪聊过 XX”：按模型/项目/时段的 token 用量、缓存命中、5h 配额窗口，外加本机全部 AI 编码会话的全文搜索。数据只在本机 127.0.0.1，与 TokenBuddy 面板同源同口径。"
+  }
+}
